@@ -1,0 +1,23 @@
+#!/bin/bash
+# pmset: a test double. -g batt answers the scenario's battery line, AC power
+# by default; -g assertions answers UserIsActive from the scenario's active
+# file, 0 by default, so presence and the battery floor are set per scenario.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+scenario=$state/scenario/pmset
+printf 'pmset %s\n' "$*" >> "$state/calls.log"
+case "$*" in
+  "-g batt")
+    if [ -f "$scenario/batt" ]; then cat "$scenario/batt"; else printf "Now drawing from 'AC Power'\n"; fi
+    ;;
+  "-g assertions")
+    active=0
+    [ -f "$scenario/active" ] && active=$(cat "$scenario/active")
+    printf 'Assertion status system-wide:\n   BackgroundTask                 0\n   UserIsActive                   %s\n' "$active"
+    ;;
+  *)
+    printf 'UNEXPECTED pmset %s\n' "$*" >> "$state/calls.log"
+    exit 97
+    ;;
+esac
+exit 0

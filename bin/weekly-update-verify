@@ -1,0 +1,662 @@
+#!/bin/bash
+# weekly-update-verify: a static regression tripwire over the weekly-update
+# files. It reads them and prints one PASS or FAIL line per check; it never
+# writes anything. It catches the edits it was written to catch. The probes in
+# tests/test-gate.sh break every deny rule in rules/ and many of the structure
+# checks on purpose and show that each of those fires; the other checks have
+# no probe. It is not a proof that the scripts are safe.
+#
+#   weekly-update-verify                 every check on the tree it lives in
+#   weekly-update-verify --runtime FILE  syntax, denylist and structure of FILE
+#   weekly-update-verify --plist FILE    LaunchAgent checks on a rendered FILE
+#   weekly-update-verify --template FILE literal checks on a template FILE
+#   weekly-update-verify --install FILE  syntax and denylist of an install.sh
+#   weekly-update-verify --uninstall FILE syntax and denylist of an uninstaller
+#   weekly-update-verify --verifier FILE syntax and denylist of a verify script
+# Exit status: 0 every check passed, 1 at least one failed, 2 usage or lib/ missing.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck disable=SC2016 # the needles below are literal source text, so a $ in them must not expand
+set -u
+set -o pipefail
+set -o noclobber
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+case ${HOME:-} in
+  /*) ;;
+  *)
+    printf '%s: HOME must be an absolute path\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac
+# A trailing slash would put "//" into the paths below, which are compared
+# with the installed LaunchAgent byte for byte.
+while :; do
+  case $HOME in
+    ?*/) HOME=${HOME%/} ;;
+    *) break ;;
+  esac
+done
+export HOME
+
+case $0 in
+  */*) SELF_DIR=$(CDPATH='' cd -P -- "${0%/*}" 2>/dev/null && pwd -P) ;;
+  *) SELF_DIR=$(CDPATH='' cd -P -- "$(dirname "$(command -v "$0")")" 2>/dev/null && pwd -P) ;;
+esac
+APP_ROOT=${SELF_DIR%/*}
+RULES_DIR=$APP_ROOT/rules
+unset _UTIL_SH_LOADED _GATE_SH_LOADED
+# shellcheck source=../lib/util.sh
+. "$APP_ROOT/lib/util.sh" || exit 2
+# shellcheck source=../lib/gate.sh
+. "$APP_ROOT/lib/gate.sh" || exit 2
+
+FAILS=0
+EXPECTED_PATH_LINE='export PATH="/usr/bin:/bin:/usr/sbin:/sbin${BREW_BIN:+:$BREW_BIN}"'
+EXPECTED_SEAM_PATH_LINE='  export PATH="$WU_TEST_SHIMS:/usr/bin:/bin:/usr/sbin:/sbin${WU_TEST_BREW_BIN:+:$WU_TEST_BREW_BIN}"'
+COMMAND_POSITION_SUDO='(^|[;&|(`{]|\$\()[[:space:]]*sudo([[:space:]]|$)'
+AGENT_PROGRAM=$HOME/.local/share/weekly-update/app/bin/weekly-update
+AGENT_LOGS=$HOME/Library/Logs/weekly-update/
+
+pass() { printf 'PASS %s\n' "$*"; }
+fail() { printf 'FAIL %s\n' "$*"; FAILS=$((FAILS + 1)); }
+
+verdict() {
+  if [ "$FAILS" -eq 0 ]; then
+    printf 'RESULT: PASS\n'
+    exit 0
+  fi
+  printf 'RESULT: FAIL %s\n' "$FAILS"
+  exit 1
+}
+
+body_of() {
+  gate_function_body "$1" "$2" 2>/dev/null
+}
+
+# It reads all of its input, unlike grep -q, so an early exit cannot become a
+# SIGPIPE failure of the writer under pipefail.
+quiet_grep() {
+  LC_ALL=C grep "$@" >/dev/null
+}
+
+count_matching() {
+  printf '%s\n' "$1" | LC_ALL=C grep -c -E -e "$2"
+}
+
+check_syntax() {
+  local file=$1 label=$2
+  if /bin/bash -n "$file" 2>/dev/null; then pass "V1 syntax, $label"; else fail "V1 syntax: bash -n rejected $label"; fi
+  if [ "$(head -n 1 "$file")" = '#!/bin/bash' ]; then
+    pass "V1 $label starts with #!/bin/bash, the stock bash the tests target"
+  else
+    fail "V1 $label must start with #!/bin/bash; an env shebang finds bash on the caller's PATH before the PATH pin runs"
+  fi
+}
+
+# The denylist cannot see redirects well, so they get their own check: after
+# the allowed forms are removed, any > left on a code line is a write.
+check_redirects() {
+  local file=$1 label=$2 extra=${3:-s/^//} hits
+  hits=$(gate_normalize < "$file" | LC_ALL=C sed -E -e "$extra" \
+    -e "s/'[^']*'//g" -e 's/"[^"]*"//g' \
+    -e 's/>>//g' -e 's/[0-9]?>&[0-9-]//g' -e 's#[0-9]?>[[:space:]]*/dev/null##g' -e 's/>&2//g' |
+    LC_ALL=C grep -n '>')
+  if [ -z "$hits" ]; then
+    pass "V2 no overwriting redirect in $label"
+  else
+    fail "V2 $label has a redirect that can write a file:"
+    printf '%s\n' "$hits" | sed 's/^/  line /'
+  fi
+}
+
+check_denylist() {
+  local file=$1 rules=$2 label=$3 output status
+  output=$(gate_check_denylist "$rules" "$file" 2>&1)
+  status=$?
+  case $status in
+    0) pass "V2 denylist ($label, ${rules##*/})" ;;
+    1)
+      fail "V2 denylist hit in $label:"
+      printf '%s\n' "$output" | sed 's/^/  /'
+      ;;
+    *)
+      fail "V2 denylist could not run on $label: $output"
+      ;;
+  esac
+}
+
+count_inside() {
+  local text=$1 needle=$2 function_name=$3 label=$4 why
+  if why=$(gate_count_inside_function "$text" "$needle" "$function_name"); then
+    pass "V3 $label"
+  else
+    fail "V3 $label: $why"
+  fi
+}
+
+order_in() {
+  local text=$1 function_name=$2 first=$3 second=$4 label=$5 body why
+  if ! body=$(body_of "$text" "$function_name"); then
+    fail "V3 $label: no function $function_name"
+    return
+  fi
+  if why=$(gate_order_in_function "$body" "$first" "$second"); then
+    pass "V3 $label"
+  else
+    fail "V3 $label: $why"
+  fi
+}
+
+contains_in() {
+  local text=$1 function_name=$2 needle=$3 label=$4 body
+  body=$(body_of "$text" "$function_name")
+  if [ -n "$body" ] && printf '%s\n' "$body" | quiet_grep -F -e "$needle"; then
+    pass "V3 $label"
+  else
+    fail "V3 $label: \"$needle\" missing from $function_name"
+  fi
+}
+
+absent_in() {
+  local text=$1 function_name=$2 needle=$3 label=$4 body
+  body=$(body_of "$text" "$function_name")
+  if [ -z "$body" ]; then
+    fail "V3 $label: no function $function_name"
+  elif printf '%s\n' "$body" | quiet_grep -F -e "$needle"; then
+    fail "V3 $label: \"$needle\" found in $function_name"
+  else
+    pass "V3 $label"
+  fi
+}
+
+line_in() {
+  local text=$1 function_name=$2 line=$3 label=$4 body
+  body=$(body_of "$text" "$function_name")
+  if [ -n "$body" ] && printf '%s\n' "$body" | LC_ALL=C sed 's/^[[:space:]]*//' | quiet_grep -x -F -e "$line"; then
+    pass "V3 $label"
+  else
+    fail "V3 $label: this line is missing from $function_name: $line"
+  fi
+}
+
+# LINE must be followed directly by NEXT, leading blanks ignored.
+pair_in() {
+  local text=$1 function_name=$2 line=$3 next=$4 label=$5 body
+  body=$(body_of "$text" "$function_name")
+  if [ -n "$body" ] && printf '%s\n' "$body" | LC_ALL=C sed 's/^[[:space:]]*//' |
+     LC_ALL=C awk -v first="$line" -v second="$next" 'previous == first && $0 == second { found = 1 } { previous = $0 } END { exit !found }'; then
+    pass "V3 $label"
+  else
+    fail "V3 $label: in $function_name, \"$line\" must be followed by \"$next\""
+  fi
+}
+
+check_head_exports() {
+  local text=$1 head name
+  head=$(printf '%s\n' "$text" | head -n 25)
+  if printf '%s\n' "$head" | quiet_grep -x 'set -o noclobber'; then pass "V3 noclobber in the head"; else fail "V3 set -o noclobber missing from the first 25 lines"; fi
+  for name in HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_AUTOREMOVE=1 HOMEBREW_NO_INSTALL_UPGRADE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1; do
+    if printf '%s\n' "$head" | quiet_grep -x -F -e "export $name"; then
+      pass "V3 update-only export in the head: $name"
+    else
+      fail "V3 export $name must be in the first 25 lines: without it Homebrew may clean up, remove, upgrade dependencies or update itself"
+    fi
+  done
+  if printf '%s\n' "$head" | quiet_grep -x -F -e 'unset HOMEBREW_CASK_OPTS' && [ "$(count_matching "$text" 'HOMEBREW_CASK_OPTS=')" = 0 ]; then
+    pass "V3 cask options are cleared in the head and never set"
+  else
+    fail "V3 HOMEBREW_CASK_OPTS must be unset in the first 25 lines and never assigned: a global --no-binaries makes every upgrade drop the cask's command-line links"
+  fi
+}
+
+check_path_pin() {
+  local text=$1 seam all inside
+  all=$(count_matching "$text" '(^|[^_[:alnum:]])PATH=')
+  seam=$(body_of "$text" apply_test_seams)
+  inside=$(count_matching "$seam" '(^|[^_[:alnum:]])PATH=')
+  if [ "$all" = 2 ] && [ "$inside" = 1 ] && printf '%s\n' "$text" | quiet_grep -x -F -e "$EXPECTED_PATH_LINE"; then
+    pass "V3 PATH is pinned once, system directories before the Homebrew bin"
+  else
+    fail "V3 PATH must be assigned exactly once outside apply_test_seams, as: $EXPECTED_PATH_LINE"
+  fi
+  if printf '%s\n' "$seam" | quiet_grep -x -F -e "$EXPECTED_SEAM_PATH_LINE"; then
+    pass "V3 the test seam keeps the same order, with the shims first"
+  else
+    fail "V3 the seam PATH must be: $EXPECTED_SEAM_PATH_LINE"
+  fi
+  if printf '%s\n' "$text" | LC_ALL=C grep -E -e '(^|[^_[:alnum:]])BREW_BIN=' | LC_ALL=C grep -v -x -E -e '[[:space:]]*BREW_BIN=(/opt/homebrew/bin|/usr/local/bin|"")' | quiet_grep .; then
+    fail "V3 BREW_BIN may only be assigned /opt/homebrew/bin, /usr/local/bin or empty"
+  else
+    pass "V3 BREW_BIN comes only from the two standard Homebrew prefixes"
+  fi
+}
+
+check_seams() {
+  local text=$1 seam total inside normalized raw_seam
+  normalized=$(printf '%s\n' "$text" | gate_normalize)
+  seam=$(body_of "$normalized" apply_test_seams)
+  total=$(count_matching "$normalized" 'WU_TEST')
+  inside=$(count_matching "$seam" 'WU_TEST')
+  if [ -n "$seam" ] && [ "$total" = "$inside" ]; then
+    pass "V3 only apply_test_seams reads WU_TEST variables"
+  else
+    fail "V3 WU_TEST is read outside apply_test_seams ($total lines in the file, $inside inside it)"
+  fi
+  raw_seam=$(body_of "$text" apply_test_seams)
+  if printf '%s\n' "$raw_seam" | quiet_grep -F '.weekly-update-test-root' &&
+     printf '%s\n' "$raw_seam" | quiet_grep -F 'command -v "$tool"'; then
+    pass "V3 seams need the sandbox marker and every replaced tool resolving to the shims"
+  else
+    fail "V3 apply_test_seams must check the sandbox marker and resolve every replaced tool"
+  fi
+  if [ "$(printf '%s\n' "$text" | LC_ALL=C grep -n -x 'apply_test_seams' | head -n 1 | cut -d : -f 1)" -lt \
+       "$(printf '%s\n' "$text" | LC_ALL=C grep -n -F '. "$LIB_DIR/util.sh"' | head -n 1 | cut -d : -f 1)" ] 2>/dev/null; then
+    pass "V3 seams apply before anything else runs"
+  else
+    fail "V3 apply_test_seams must be called before the library is loaded"
+  fi
+}
+
+check_sudo_sites() {
+  local text=$1 normalized all restart macos
+  normalized=$(printf '%s\n' "$text" | gate_normalize)
+  all=$(count_matching "$normalized" "$COMMAND_POSITION_SUDO")
+  restart=$(count_matching "$(body_of "$normalized" consent_restart)" "$COMMAND_POSITION_SUDO")
+  macos=$(count_matching "$(body_of "$normalized" phase_macos)" "$COMMAND_POSITION_SUDO")
+  if [ "$all" -gt 0 ] && [ "$all" = $((restart + macos)) ]; then
+    pass "V3 every sudo is inside consent_restart or phase_macos ($all sites)"
+  else
+    fail "V3 sudo outside consent_restart and phase_macos: $all sites in the file, $restart and $macos inside them"
+  fi
+  order_in "$text" phase_macos '[ "$live" = live ] || return 0' 'sudo' "I8 phase_macos returns before any sudo unless live"
+  order_in "$text" phase_macos '[ "$live" = live ] || return 0' 'consent_restart' "I8 phase_macos returns before any restart question unless live"
+  order_in "$text" phase_macos '[ "$DRY_RUN" = 1 ]' 'sudo' "phase_macos: the dry-run guard precedes sudo"
+  order_in "$text" phase_macos '[ "$DRY_RUN" = 1 ]' 'prompt_consent' "phase_macos: the dry-run guard precedes the install question"
+  order_in "$text" phase_macos 'prompt_consent' 'sudo' "phase_macos: the install question comes before the first sudo"
+  contains_in "$text" phase_macos 'recommended macOS update(s) listed above? This needs the administrator password and accepts' "phase_macos: the install question names the password and the license terms"
+  contains_in "$text" mode_auto 'phase_macos dry' "I8 the unattended pass lists macOS updates only"
+  absent_in "$text" mode_auto 'phase_macos live' "I8 the unattended pass never installs macOS updates"
+  absent_in "$text" mode_auto 'consent_restart' "I8 the unattended pass never asks for a restart"
+  absent_in "$text" auto_finish 'phase_macos live' "I8 the unattended decision never installs macOS updates"
+  count_inside "$text" 'phase_macos live' run_full_pass "I8 macOS installs are reachable only from the interactive pass"
+}
+
+# These rules decide which apps may be upgraded with nobody watching and which
+# may be adopted, where a rolled-back adoption, or the undoing of a failed
+# upgrade's revert, would remove the app.
+check_classification() {
+  local text=$1 line name
+  for line in \
+    'SILENT_SAFE_KEYS="app uninstall zap binary command_wrapper bash_completion zsh_completion fish_completion"' \
+    'ADOPT_SAFE_KEYS="app uninstall zap binary command_wrapper"'; do
+    name=${line%%=*}
+    if [ "$(count_matching "$text" "(^|[^_[:alnum:]])$name=")" = 1 ] && printf '%s\n' "$text" | quiet_grep -x -F -e "$line"; then
+      pass "V3 $name is assigned once, exactly as ${line#*=}"
+    else
+      fail "V3 $name must be assigned once, exactly as ${line#*=}"
+    fi
+  done
+  if [ "$(count_matching "$text" 'select[(][.] != ')" = 1 ] && printf '%s\n' "$text" | quiet_grep -F -e 'keys[] | select(. != "target")] | unique | join(" ")'; then
+    pass "V3 the artifact kinds leave out only Homebrew's resolved target field"
+  else
+    fail "V3 the artifact kinds must leave out only Homebrew's resolved target field, never a kind"
+  fi
+  line_in "$text" load_dock_inventory 'managed=no; adopt_safe=no; silent_safe=no; extra=""; helper_count=0; drop=0' "an app starts neither adoptable nor silent"
+  pair_in "$text" load_dock_inventory 'if ! util_contains_word "$artifact" "$ADOPT_SAFE_KEYS"; then' 'adopt_safe=no' "an artifact off the adoption allowlist blocks adoption"
+  line_in "$text" load_dock_inventory 'util_contains_word "$artifact" "$SILENT_SAFE_KEYS" || silent_safe=no' "an artifact off the silent allowlist blocks the silent group"
+  pair_in "$text" load_dock_inventory 'if [ "$cask_app" != "${path##*/}" ]; then' 'group=manual' "a cask whose app name differs from the bundle is manual"
+  pair_in "$text" load_dock_inventory 'elif [ "${pkg_count:-0}" != 0 ] || [ "$silent_safe" = no ]; then' 'group=assisted' "a cask with a pkg or an artifact off the silent allowlist is assisted"
+  pair_in "$text" load_dock_inventory 'case ",$uninstall_keys," in' ',,|,quit,|,signal,|,quit,signal,) group=silent ;;' "only an uninstall stanza of quit or signal can be silent"
+  pair_in "$text" load_dock_inventory ',,|,quit,|,signal,|,quit,signal,) group=silent ;;' '*) group=assisted ;;' "any other uninstall stanza is assisted"
+  count_inside "$text" 'group=silent' load_dock_inventory "the silent group is assigned in one place"
+  line_in "$text" run_never_killed "( trap '' HUP INT TERM; exec \"\$@\" ) >>\"\$RUN_SINK\" 2>&1 8<&- 9>&- &" "replacing an app starts with HUP, INT and TERM ignored"
+  contains_in "$text" adopt_cask 'brew install --cask --adopt --no-binaries "$token"' "adopt: without command-line links, whose conflict would roll the adoption back"
+  pair_in "$text" load_dock_inventory 'if link_block=$(link_in_the_way "$link_paths"); then' 'adopt_safe=no' "a file in the way of a command-line link blocks adoption"
+  pair_in "$text" load_dock_inventory 'adopt_safe=no' 'silent_safe=no' "a file in the way of a command-line link keeps the app out of the silent group"
+  contains_in "$text" link_in_the_way 'if [ -e "$entry" ] && [ ! -L "$entry" ]; then' "anything but a link at a link path is in the way"
+  contains_in "$text" link_in_the_way "'?'*) printf '%s' \"\$entry\"; return 0 ;;" "a link path that cannot be placed counts as in the way"
+  contains_in "$text" upgrade_blocked_by_link 'report_failure' "a file in the way is a failure, so the pass asks for a person"
+  order_in "$text" upgrade_cask 'upgrade_blocked_by_link "$i"' 'upgrade --cask' "upgrade_cask: a file in the way of a command-line link stops the upgrade, in every mode"
+  contains_in "$text" phase_dock_apps 'if upgrade_blocked_by_link "$i"; then' "an outdated app with a file in the way is never offered for upgrade"
+}
+
+check_structure() {
+  local text=$1 lint
+  check_head_exports "$text"
+  check_path_pin "$text"
+  check_seams "$text"
+  if lint=$(gate_lint_function_columns "$text"); then
+    pass "V3 functions follow the column-0 convention the checks rely on"
+  else
+    fail "V3 function layout: $lint"
+  fi
+
+  count_inside "$text" 'upgrade --cask' upgrade_cask "brew upgrade once, inside upgrade_cask"
+  count_inside "$text" 'install --cask --adopt' adopt_cask "brew adopt once, inside adopt_cask"
+  count_inside "$text" '\" to quit"' quit_app_gracefully "app quit once, inside quit_app_gracefully"
+  count_inside "$text" 'open -b "$bundle"' reopen_app "app launch once, inside reopen_app"
+  count_inside "$text" 'open -a Terminal "$SHIM"' open_window "window once, inside open_window"
+  count_inside "$text" '--restart' consent_restart "--restart once, inside consent_restart"
+  count_inside "$text" 'display notification' notify "notification once, inside notify"
+  count_inside "$text" '>> "$NUDGE_LEDGER"' record_nudge "the nudge ledger is append-only, written in one place"
+  count_inside "$text" 'lifecycle_take_lock "$LOCK_FILE"' take_lock_or_stand_down "the run lock is taken in one place"
+
+  order_in "$text" upgrade_cask '[ "$DRY_RUN" = 1 ]' 'upgrade --cask' "upgrade_cask: the dry-run guard precedes the upgrade"
+  order_in "$text" upgrade_cask 'app_confirmed' 'upgrade --cask' "upgrade_cask: only confirmed apps are upgraded"
+  order_in "$text" upgrade_cask '! -w "$path"' 'quit_app_gracefully' "upgrade_cask: no app is quit for an upgrade that cannot happen"
+  order_in "$text" upgrade_cask '! -w "$path"' 'upgrade --cask' "upgrade_cask: the unwritable-bundle refusal precedes the upgrade"
+  order_in "$text" upgrade_cask 'staged_blocker' 'upgrade --cask' "upgrade_cask: the leftover-copy refusal precedes the upgrade"
+  order_in "$text" upgrade_cask '[ "$MODE" = auto ]' 'quit_app_gracefully' "upgrade_cask: the unattended pass returns before any quit"
+  order_in "$text" upgrade_cask '[ "$MODE" = auto ]' 'prompt_consent' "upgrade_cask: the unattended pass never asks to quit"
+  order_in "$text" quit_app_gracefully '[ "$DRY_RUN" = 1 ]' '\" to quit"' "quit: the dry-run guard precedes the quit"
+  order_in "$text" quit_app_gracefully '[ "$MODE" = auto ]' '\" to quit"' "quit: refused in the unattended pass"
+  contains_in "$text" quit_app_gracefully '"$QUIT_WAIT"' "quit waits for the app and gives up"
+  order_in "$text" reopen_app '[ "$DRY_RUN" = 1 ]' 'open -b' "reopen: the dry-run guard precedes the launch"
+  order_in "$text" adopt_cask '[ "$DRY_RUN" = 1 ]' 'install --cask --adopt' "adopt: the dry-run guard precedes the adoption"
+  order_in "$text" adopt_cask 'app_adoptable' 'install --cask --adopt' "adopt: only casks with no roll-back-capable step"
+  order_in "$text" adopt_cask 'app_writable' 'install --cask --adopt' "adopt: only writable bundles"
+  order_in "$text" adopt_cask 'app_in_apps' 'install --cask --adopt' "adopt: only apps directly in the Applications folder"
+  order_in "$text" mode_setup 'app_adoptable[$i]}" != yes' 'adopt_cask "$i"' "setup: adoption is offered only after the adoptable check"
+  order_in "$text" consent_restart '[ "$DRY_RUN" = 1 ]' 'prompt_consent' "restart: the dry-run guard precedes the question"
+  order_in "$text" consent_restart 'report_history restart-requested' '--restart' "I3 the restart request is on record before the install"
+  order_in "$text" consent_restart 'prompt_consent' '--restart' "I3 a restart needs its own yes"
+  contains_in "$text" consent_restart 'and restart now?" no' "I3 the restart question defaults to No"
+  order_in "$text" open_window '[ "$DRY_RUN" = 1 ]' 'open -a Terminal' "window: the dry-run guard precedes the window"
+  order_in "$text" notify '[ "$DRY_RUN" = 1 ]' 'osascript' "notify: the dry-run guard precedes the notification"
+  order_in "$text" record_nudge '[ "$DRY_RUN" = 1 ]' '>> "$NUDGE_LEDGER"' "nudge ledger: the dry-run guard precedes the write"
+  if printf '%s\n' "$text" | quiet_grep -E -e 'prompt_consent .*[[:space:]]yes([;[:space:]]|$)'; then
+    fail "V3 a consent question defaults to yes; every question here defaults to No"
+  else
+    pass "V3 every consent question defaults to No"
+  fi
+
+  check_sudo_sites "$text"
+  check_classification "$text"
+
+  contains_in "$text" mode_auto 'export HOMEBREW_NO_UPGRADE_QUIT_CASKS=1' "I1 Homebrew's own quit is off in the unattended pass"
+  order_in "$text" mode_auto 'pass_finished_since_slot_day' 'preflight' "the slot stands down before any work once a pass finished on or after the slot day"
+  order_in "$text" mode_auto 'preflight' 'load_dock_inventory' "the unattended pass runs the shared preflight first"
+  order_in "$text" mode_auto 'refresh_index' 'load_dock_inventory' "I5 a slot that cannot refresh the index defers before deciding"
+  order_in "$text" mode_auto 'phase_dock_apps' 'compute_escalation' "the escalation is computed after the app work, from what it found"
+  order_in "$text" phase_dock_apps 'app_is_running' 'upgrade_cask' "a running app is skipped before any upgrade in the unattended pass"
+  order_in "$text" auto_finish 'user_is_at_the_mac' '"escalation deferred"' "presence is read before a deferral is recorded"
+  order_in "$text" auto_finish 'user_is_at_the_mac' 'open_window' "I6 no window opens unless someone is at the Mac"
+  order_in "$text" auto_finish '[ "$DRY_RUN" != 1 ]' 'notify' "auto: a dry run leaves before any notification"
+  if printf '%s\n' "$(body_of "$text" mode_auto)" | LC_ALL=C awk '/phase_dock_apps/ { seen = 1; next } seen && /report_verdict|report_history/ { bad = 1 } END { exit !bad }'; then
+    fail "V3 mode_auto writes a history row after the upgrade work but before the escalation decision"
+  else
+    pass "V3 the pass row is written only by auto_finish, after the decision"
+  fi
+  if printf '%s\n' "$text" | quiet_grep -x -e 'TERMINAL_OUTCOMES="completed partial escalated declined started"'; then
+    pass "V3 deferrals are not terminal, so a later slot retries them"
+  else
+    fail "V3 TERMINAL_OUTCOMES must be exactly: completed partial escalated declined started"
+  fi
+
+  contains_in "$text" preflight 'take_lock_or_stand_down' "I7 the shared preflight takes the run lock"
+  contains_in "$text" preflight 'check_battery' "the shared preflight checks the battery"
+  contains_in "$text" preflight 'lifecycle_keep_awake' "the shared preflight keeps the Mac awake"
+  contains_in "$text" run_full_pass 'preflight' "run and scheduled use the shared preflight"
+  contains_in "$text" mode_setup 'preflight' "setup uses the shared preflight"
+  contains_in "$text" mode_auto 'preflight' "auto uses the shared preflight"
+  contains_in "$text" mode_run 'run_full_pass' "run goes through the full pass"
+  contains_in "$text" mode_scheduled 'run_full_pass' "scheduled goes through the full pass"
+  contains_in "$text" take_lock_or_stand_down '-eq 75' "I7 only lock status 75 means busy"
+  order_in "$text" mode_scheduled 'prompt_timed' 'run_full_pass' "the window asks before it does anything"
+  order_in "$text" mode_scheduled 'lifecycle_release_awake' 'read -r -t "$FINAL_PROMPT_TIMEOUT"' "keep-awake stops before the closing prompt"
+  order_in "$text" mode_scheduled 'lifecycle_release_lock' 'read -r -t "$FINAL_PROMPT_TIMEOUT"' "the lock is released before the closing prompt"
+
+  contains_in "$text" query_outdated 'status=$?' "the outdated query checks its exit status"
+  contains_in "$text" query_outdated 'error("unexpected shape")' "the outdated answer is checked for shape"
+  contains_in "$text" query_cask 'return 1' "a failed cask query is reported, not assumed"
+  order_in "$text" phase_dock_apps 'query_ok" = 0' 'matches the index' "no \"matches the index\" after a failed query"
+  contains_in "$text" phase_dock_apps '[ "$query_ok" = 0 ] || report_stale_records "$outdated"' "stale-record warnings only after a successful outdated query, never for an outdated app"
+  order_in "$text" mode_check 'if query_outdated; then' 'report_stale_records "$outdated"' "check warns of a stale record only for an app brew outdated does not list"
+  contains_in "$text" load_dock_inventory '"query(dock)"' "unreadable Dock preferences are a failure, never an empty Dock"
+  contains_in "$text" phase_macos '"query(softwareupdate)"' "an unreadable macOS listing is a failure, never current"
+  contains_in "$text" app_is_running '[ "$status" -ne 1 ]' "an app whose running state is unknown counts as running"
+  contains_in "$text" app_is_running 'pgrep -q -f "^$(ere_escape "$1")/"' "any process started from inside the bundle counts as the app running"
+  order_in "$text" preflight '! -w "$HISTORY_FILE"' 'take_lock_or_stand_down' "a history file that cannot be written stops the pass before it acts"
+  contains_in "$text" compute_escalation 'app_state' "the escalation reads the inventory"
+  contains_in "$text" compute_escalation 'TOUCHED_THIS_PASS' "the escalation ignores work this pass just did"
+  absent_in "$text" compute_escalation 'OUTDATED_TOKENS' "the escalation does not trust brew outdated alone"
+  if printf '%s\n' "$text" | quiet_grep -F '$(compute_escalation)'; then
+    fail "V3 compute_escalation must never run in a command substitution; its lists would be lost"
+  else
+    pass "V3 the escalation lists survive the call"
+  fi
+  order_in "$text" phase_nudge 'APP_STEP_ALLOWED' 'reopen_app' "the nudge respects the battery gate"
+  order_in "$text" phase_nudge 'prompt_consent' 'reopen_app' "nothing is opened before the consent"
+  order_in "$text" phase_nudge 'record_nudge' 'reopen_app' "every attempt is recorded before the app is opened"
+  contains_in "$text" phase_nudge 'did-not-start' "a launch that failed is marked, so it is not counted"
+  contains_in "$text" load_dock_inventory 'group=assisted; fi' "an unwritable bundle leaves the silent group"
+  contains_in "$text" compare_versions 'unordered' "an empty or odd version compares as unordered"
+  contains_in "$text" mode_check 'DRY_RUN=1' "check writes nothing"
+  contains_in "$text" mode_status 'DRY_RUN=1' "status writes nothing"
+}
+
+plist_get() {
+  printf '%s\n' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null
+}
+
+check_plist_text() {
+  local text=$1 label=$2 slot weekday first_weekday hour minute count=0 bad=0 value
+  if printf '%s\n' "$text" | plutil -lint - >/dev/null 2>&1; then pass "V4 $label lints"; else fail "V4 $label does not lint"; fi
+  if [ "$(plist_get "$text" RunAtLoad)" = false ]; then pass "V4 I9 $label: RunAtLoad is false"; else fail "V4 I9 $label: RunAtLoad must be present and false, so loading never starts a pass"; fi
+  if [ "$(plist_get "$text" LimitLoadToSessionType)" = Aqua ]; then pass "V4 I9 $label: loads only in a GUI login session"; else fail "V4 I9 $label: LimitLoadToSessionType must be Aqua"; fi
+  if plist_get "$text" KeepAlive >/dev/null; then fail "V4 I9 $label: KeepAlive implies RunAtLoad and must be absent"; else pass "V4 I9 $label: no KeepAlive"; fi
+  if plist_get "$text" EnvironmentVariables >/dev/null; then fail "V4 $label: EnvironmentVariables must be absent, so no PATH or HOME is injected"; else pass "V4 $label: no injected environment"; fi
+  if [ "$(plist_get "$text" ProgramArguments.0)" = "$AGENT_PROGRAM" ] && [ "$(plist_get "$text" ProgramArguments.1)" = auto ] && ! plist_get "$text" ProgramArguments.2 >/dev/null; then
+    pass "V4 $label runs the installed runtime in auto mode and nothing else"
+  else
+    fail "V4 $label: ProgramArguments must be exactly $AGENT_PROGRAM auto"
+  fi
+  value=$(plist_get "$text" Label)
+  case $value in
+    *.weekly-update) pass "V4 $label label $value" ;;
+    *) fail "V4 $label: Label must end in .weekly-update, got \"$value\"" ;;
+  esac
+  for value in StandardOutPath StandardErrorPath; do
+    case $(plist_get "$text" "$value") in
+      "$AGENT_LOGS"*) pass "V4 $label $value is under the log folder" ;;
+      *) fail "V4 $label: $value must be under $AGENT_LOGS" ;;
+    esac
+  done
+  slot=0
+  first_weekday=""
+  while [ "$slot" -lt 48 ]; do
+    weekday=$(plist_get "$text" "StartCalendarInterval.$slot.Weekday") || break
+    hour=$(plist_get "$text" "StartCalendarInterval.$slot.Hour")
+    minute=$(plist_get "$text" "StartCalendarInterval.$slot.Minute")
+    count=$((count + 1))
+    [ -n "$first_weekday" ] || first_weekday=$weekday
+    [ "$weekday" = "$first_weekday" ] || bad=1
+    case "$weekday:$hour:$minute" in
+      [0-6]:[0-9]:[0-9]|[0-6]:[0-9]:[0-5][0-9]|[0-6]:1[0-9]:[0-9]|[0-6]:1[0-9]:[0-5][0-9]|[0-6]:2[0-3]:[0-9]|[0-6]:2[0-3]:[0-5][0-9]) ;;
+      *) bad=1 ;;
+    esac
+    slot=$((slot + 1))
+  done
+  if [ "$count" -ge 2 ] && [ "$bad" = 0 ]; then
+    pass "V4 $label has $count weekly slots on one weekday"
+  else
+    fail "V4 $label: the calendar needs at least two slots on one weekday, each with a valid Weekday, Hour and Minute"
+  fi
+}
+
+check_template() {
+  local file=$1 text
+  text=$(cat "$file")
+  if printf '%s\n' "$text" | LC_ALL=C awk '/<key>RunAtLoad<\/key>/ { getline next_line; if (next_line ~ /^[[:space:]]*<false\/>[[:space:]]*$/) found = 1 } END { exit !found }'; then
+    pass "V4 I9 the template writes RunAtLoad false as a literal"
+  else
+    fail "V4 I9 the template must write <key>RunAtLoad</key> followed by <false/>"
+  fi
+  if printf '%s\n' "$text" | LC_ALL=C awk '/<key>LimitLoadToSessionType<\/key>/ { getline next_line; if (next_line ~ /<string>Aqua<\/string>/) found = 1 } END { exit !found }'; then
+    pass "V4 I9 the template writes LimitLoadToSessionType Aqua as a literal"
+  else
+    fail "V4 I9 the template must write LimitLoadToSessionType Aqua"
+  fi
+  if printf '%s\n' "$text" | quiet_grep -e 'KeepAlive' -e 'EnvironmentVariables'; then
+    fail "V4 I9 the template must not name KeepAlive or EnvironmentVariables"
+  else
+    pass "V4 I9 the template has no KeepAlive and no environment"
+  fi
+  if printf '%s\n' "$text" | quiet_grep -F '__HOME__' && printf '%s\n' "$text" | quiet_grep -F '__LABEL__' && printf '%s\n' "$text" | quiet_grep -x -F '__CALENDAR__'; then
+    pass "V4 the template carries the __HOME__, __LABEL__ and __CALENDAR__ tokens"
+  else
+    fail "V4 the template must carry __HOME__, __LABEL__ and a __CALENDAR__ line"
+  fi
+}
+
+check_ascii() {
+  local file=$1 bad
+  bad=$(LC_ALL=C grep -n '[^[:print:][:space:]]' "$file" | head -n 3)
+  if [ -z "$bad" ]; then
+    pass "V6 ASCII ${file#"$APP_ROOT"/}"
+  else
+    fail "V6 non-ASCII byte in ${file#"$APP_ROOT"/}:"
+    printf '%s\n' "$bad" | cut -c 1-80 | sed 's/^/  /'
+  fi
+}
+
+check_runtime_file() {
+  local file=$1 text
+  check_syntax "$file" "${file##*/}"
+  check_denylist "$file" "$RULES_DIR/runtime.rules" "${file##*/}"
+  check_redirects "$file" "${file##*/}"
+  text=$(cat "$file")
+  check_structure "$text"
+}
+
+check_install_file() {
+  check_syntax "$1" "${1##*/}"
+  check_denylist "$1" "$RULES_DIR/install.rules" "${1##*/}"
+  check_redirects "$1" "${1##*/}" 's#> "\$PLIST"##'
+}
+
+check_uninstall_file() {
+  check_syntax "$1" "${1##*/}"
+  check_denylist "$1" "$RULES_DIR/uninstall.rules" "${1##*/}"
+  check_redirects "$1" "${1##*/}"
+}
+
+check_verifier_file() {
+  check_syntax "$1" "${1##*/}"
+  check_denylist "$1" "$RULES_DIR/verify.rules" "${1##*/}"
+  check_redirects "$1" "${1##*/}" 's/>>/> /g'
+}
+
+installed_manifest_checks() {
+  local manifest=$APP_ROOT/install-manifest.tsv kind path sum shim expected plist launcher_app
+  shim=$APP_ROOT/bin/weekly-update-scheduled
+  if [ ! -f "$manifest" ]; then
+    printf 'NOTE not an installed copy (no install-manifest.tsv), so the LaunchAgent on disk and the window launcher are not checked\n'
+    return 0
+  fi
+  while IFS=$'\t' read -r kind path sum; do
+    [ "$kind" = file ] || continue
+    if [ -f "$path" ] && [ "$(shasum -a 256 "$path" | cut -d ' ' -f 1)" = "$sum" ]; then
+      pass "V5 unchanged since install: ${path##*/}"
+    else
+      fail "V5 changed or missing since install: $path"
+    fi
+  done < "$manifest"
+  # install writes the launcher with its own spelling of the tool folder, which
+  # goes through a symlinked home folder rather than its physical path, and
+  # renders %q under the C locale.
+  launcher_app=$APP_ROOT
+  if [ "$(CDPATH='' cd -P -- "$HOME/.local/share/weekly-update/app" 2>/dev/null && pwd -P)" = "$APP_ROOT" ]; then
+    launcher_app=$HOME/.local/share/weekly-update/app
+  fi
+  expected=$(LC_ALL=C; printf '#!/bin/bash\nexec %q scheduled\n' "$launcher_app/bin/weekly-update")
+  if [ -f "$shim" ] && [ "$(cat "$shim")" = "$expected" ]; then
+    pass "V2 the window launcher only execs the runtime in scheduled mode (byte compare)"
+  else
+    fail "V2 the window launcher must be exactly: $expected"
+  fi
+  if [ -x "$shim" ]; then pass "V7 the window launcher is executable"; else fail "V7 the window launcher is not executable"; fi
+  # shellcheck disable=SC2010,SC2012 # ls -l@ lists extended attributes without running xattr; both names are fixed paths
+  if ls -l@ "$shim" "$APP_ROOT/bin/weekly-update" 2>/dev/null | quiet_grep 'com.apple.quarantine'; then
+    fail "V7 a quarantine attribute would stop the window from opening"
+  else
+    pass "V7 no quarantine attribute on the launcher or the runtime"
+  fi
+  [ -f "$shim" ] && check_ascii "$shim"
+  plist=$(LC_ALL=C awk -F'\t' '$1 == "file" && $2 ~ /\.plist$/ { print $2 }' "$manifest")
+  if [ -n "$plist" ] && [ -f "$plist" ]; then
+    check_plist_text "$(cat "$plist")" "LaunchAgent on disk"
+    if [ "$(cat "$plist")" = "$RENDERED" ]; then
+      pass "V4 the LaunchAgent on disk equals the rendering of the current config"
+    else
+      fail "V4 the LaunchAgent on disk differs from the rendering of the current config; run install.sh again"
+    fi
+  else
+    fail "V4 the installed LaunchAgent is missing: ${plist:-unknown path}"
+  fi
+}
+
+full_check() {
+  local runtime=$APP_ROOT/bin/weekly-update file
+  for file in "$runtime" "$APP_ROOT/bin/weekly-update-uninstall" "$APP_ROOT/templates/launchagent.plist.template" "$RULES_DIR/runtime.rules"; do
+    if [ ! -f "$file" ]; then
+      fail "missing file: $file"
+      verdict
+    fi
+  done
+  check_runtime_file "$runtime"
+  check_verifier_file "$APP_ROOT/bin/weekly-update-verify"
+  check_uninstall_file "$APP_ROOT/bin/weekly-update-uninstall"
+  [ ! -f "$APP_ROOT/install.sh" ] || check_install_file "$APP_ROOT/install.sh"
+  [ ! -f "$APP_ROOT/uninstall.sh" ] || check_syntax "$APP_ROOT/uninstall.sh" uninstall.sh
+  check_template "$APP_ROOT/templates/launchagent.plist.template"
+  if RENDERED=$(/bin/bash "$runtime" plist 2>/dev/null) && [ -n "$RENDERED" ]; then
+    check_plist_text "$RENDERED" "rendering of the current config"
+  else
+    fail "V4 the runtime could not render the LaunchAgent (is the config valid?)"
+    RENDERED=""
+  fi
+  if (cd "$APP_ROOT/lib" && shasum -a 256 -c MANIFEST.sha256 >/dev/null 2>&1); then
+    pass "V5 lib/ matches lib/MANIFEST.sha256"
+  else
+    fail "V5 lib/ differs from lib/MANIFEST.sha256"
+  fi
+  for file in "$APP_ROOT"/bin/* "$APP_ROOT"/lib/*.sh "$APP_ROOT"/rules/* "$APP_ROOT"/templates/* "$APP_ROOT"/install.sh "$APP_ROOT"/uninstall.sh "$APP_ROOT"/config/*; do
+    [ -f "$file" ] || continue
+    case $file in
+      */bin/weekly-update-scheduled) continue ;;
+    esac
+    check_ascii "$file"
+  done
+  installed_manifest_checks
+  verdict
+}
+
+RENDERED=""
+case ${1:-} in
+  '')
+    full_check
+    ;;
+  --runtime|--plist|--template|--install|--uninstall|--verifier)
+    if [ "$#" -ne 2 ] || [ ! -f "$2" ]; then
+      printf 'weekly-update-verify: %s needs one readable file\n' "$1" >&2
+      exit 2
+    fi
+    case $1 in
+      --runtime) check_runtime_file "$2" ;;
+      --plist) check_plist_text "$(cat "$2")" "${2##*/}" ;;
+      --template) check_template "$2" ;;
+      --install) check_install_file "$2" ;;
+      --uninstall) check_uninstall_file "$2" ;;
+      --verifier) check_verifier_file "$2" ;;
+    esac
+    verdict
+    ;;
+  -h|--help)
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    printf 'weekly-update-verify: unknown argument %s (see --help)\n' "$1" >&2
+    exit 2
+    ;;
+esac

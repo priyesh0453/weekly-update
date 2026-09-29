@@ -1,0 +1,21 @@
+# Denylist for install.sh: it may copy the tool into a staging folder, move a
+# previous copy or LaunchAgent aside, write one LaunchAgent, and load or unload
+# its own schedule. Same normalization as rules/runtime.rules; CP means command
+# position.
+
+deny delete (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?(rm|rmdir|unlink|srm|shred|truncate|dd|ditto|install|rsync|ln|chown|chflags|xattr|killall|pkill|kill|tee)([[:space:]]|$)
+deny run-elsewhere (^|[;&|(`{]|\$\()[[:space:]]*(sudo|env|python|python3|perl|ruby|node|xargs|git|curl|wget|nc|ssh|scp|brew|softwareupdate|osascript|open|defaults|pmset|caffeinate)([[:space:]]|$)
+deny eval (^|[^[:alnum:]_])eval([[:space:]]|$)
+deny clobber >\|
+deny copy (^|[;&|(`{]|\$\()[[:space:]]*cp[[:space:]]
+allow copy ^[[:space:]]*cp -R "\$SRC/\$part" "\$STAGE/" 
+deny move (^|[;&|(`{]|\$\()[[:space:]]*mv[[:space:]]
+allow move ^[[:space:]]*mv "\$APP" "\$ASIDE/app" 
+allow move ^[[:space:]]*mv "\$old_plist" "\$ASIDE/" 
+allow move ^[[:space:]]*mv "\$STAGE" "\$APP" 
+deny chmod (^|[;&|(`{]|\$\()[[:space:]]*chmod[[:space:]]
+allow chmod ^[[:space:]]*chmod 755 "\$STAGE/bin/weekly-update" 
+deny launchctl-change (^|[;&|(`{]|\$\()[[:space:]]*launchctl[[:space:]]+(bootout|bootstrap|remove|unload|load|kickstart|enable|disable|kill|submit|setenv)
+allow launchctl-change ^[[:space:]]*launchctl bootstrap "gui/\$USER_ID" "\$PLIST" 
+allow launchctl-change ^[[:space:]]*launchctl enable "gui/\$USER_ID/\$LABEL" 
+allow launchctl-change ^[[:space:]]*launchctl bootout "gui/\$USER_ID/\$label" 

@@ -1,0 +1,23 @@
+#!/bin/bash
+# caffeinate: a test double for caffeinate -i -w PID. It records its own pid
+# and waits while PID lives, like the real one, without touching power
+# management. The library signals keep-awake only while it is a child of the
+# runtime named caffeinate, and macOS names a process after the path that
+# started it, so the double runs again under a link to bash called caffeinate.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+named=$state/named/caffeinate
+# The base name, not the path: bash stores a relative link path in $BASH as an
+# absolute one, so a relative state folder would never match and re-exec forever.
+if [ "${BASH##*/}" != caffeinate ]; then
+  mkdir -p "$state/named" || exit 97
+  [ -L "$named" ] || ln -s /bin/bash "$named" 2>/dev/null || [ -L "$named" ] || exit 97
+  exec "$named" "$0" "$@"
+fi
+printf 'caffeinate %s\n' "$*" >> "$state/calls.log"
+printf '%s\n' "$$" >> "$state/caffeinate.pids"
+[ "${1:-}" = -i ] && [ "${2:-}" = -w ] || exit 97
+while kill -0 "${3:-0}" 2>/dev/null; do
+  sleep 1
+done
+exit 0

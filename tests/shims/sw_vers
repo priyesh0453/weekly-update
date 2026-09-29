@@ -1,0 +1,7 @@
+#!/bin/bash
+# sw_vers: a test double. -productVersion answers the scenario's sw_vers file,
+# or 15.1, so a listing can be judged a major upgrade or not.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+printf 'sw_vers %s\n' "$*" >> "$state/calls.log"
+if [ -f "$state/scenario/sw_vers" ]; then cat "$state/scenario/sw_vers"; else printf '15.1\n'; fi

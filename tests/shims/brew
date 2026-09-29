@@ -1,0 +1,117 @@
+#!/bin/bash
+# brew: a test double. It records every call in calls.log, with the Homebrew
+# settings it ran under in brew-env.log, and answers from the scenario folder;
+# a call the scenarios do not expect is logged as UNEXPECTED and exits 97.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+scenario=$state/scenario/brew
+record() {
+  local cask_opts=unset
+  [ -z "${HOMEBREW_CASK_OPTS+set}" ] || cask_opts="[$HOMEBREW_CASK_OPTS]"
+  printf '%s\n' "$*" >> "$state/calls.log"
+  printf '%s | cleanup=%s autoremove=%s install-upgrade=%s env-hints=%s auto-update=%s cask-opts=%s\n' "$*" \
+    "${HOMEBREW_NO_INSTALL_CLEANUP:-unset}" "${HOMEBREW_NO_AUTOREMOVE:-unset}" "${HOMEBREW_NO_INSTALL_UPGRADE:-unset}" \
+    "${HOMEBREW_NO_ENV_HINTS:-unset}" "${HOMEBREW_NO_AUTO_UPDATE:-unset}" "$cask_opts" >> "$state/brew-env.log"
+}
+unexpected() { record "UNEXPECTED brew $*"; exit 97; }
+status_of() { if [ -f "$scenario/$1.status" ]; then cat "$scenario/$1.status"; else printf '%s' "${2:-0}"; fi; }
+# Homebrew removes the old version's command-line link on every cask upgrade
+# and creates the new one only when binaries are on; the scenario names the
+# link in upgrade-TOKEN.link and its target in upgrade-TOKEN.link-target.
+relink() {
+  local link
+  [ -f "$scenario/upgrade-$1.link" ] || return 0
+  link=$(cat "$scenario/upgrade-$1.link")
+  if [ -L "$link" ]; then mv "$link" "$link.unlinked-by-test-double"; fi
+  case " ${HOMEBREW_CASK_OPTS:-} $* " in
+    *" --no-binaries "*) return 0 ;;
+  esac
+  ln -s "$(cat "$scenario/upgrade-$1.link-target")" "$link"
+}
+# With binaries on, a file that is not a link at that path fails the new
+# version's link. Homebrew's revert links the old version into the same file
+# and fails again, and undoing that revert moves the old app out of the
+# Applications folder and purges it. The double moves it into the state folder.
+link_conflict() {
+  local link
+  [ -f "$scenario/upgrade-$1.link" ] || return 1
+  case " ${HOMEBREW_CASK_OPTS:-} $* " in
+    *" --no-binaries "*) return 1 ;;
+  esac
+  link=$(cat "$scenario/upgrade-$1.link")
+  [ -e "$link" ] && [ ! -L "$link" ]
+}
+case "$*" in
+  --version) record "brew $*"; printf 'Homebrew 4.4.0\n' ;;
+  --prefix) record "brew $*"; if [ -f "$scenario/prefix" ]; then cat "$scenario/prefix"; else printf '/opt/homebrew\n'; fi ;;
+  --caskroom) record "brew $*"; printf '%s\n' "$state/caskroom" ;;
+  --cache) record "brew $*"; printf '%s\n' "$state/brew-cache" ;;
+  update)
+    record "brew $*"
+    [ -f "$scenario/update.sleep" ] && sleep "$(cat "$scenario/update.sleep")"
+    exit "$(status_of update)"
+    ;;
+  "info --cask --installed --json=v2")
+    record "brew $*"
+    [ -f "$scenario/installed.sleep" ] && sleep "$(cat "$scenario/installed.sleep")"
+    if [ -f "$scenario/installed.json" ]; then cat "$scenario/installed.json"; else printf '{"casks":[]}\n'; fi
+    exit "$(status_of installed)"
+    ;;
+  "outdated --cask --json=v2")
+    record "brew $*"
+    [ -f "$scenario/outdated.sleep" ] && sleep "$(cat "$scenario/outdated.sleep")"
+    if [ -f "$scenario/outdated.json" ]; then cat "$scenario/outdated.json"; else printf '{"formulae":[],"casks":[]}\n'; fi
+    exit "$(status_of outdated)"
+    ;;
+  "info --cask "*" --json=v2")
+    record "brew $*"
+    token=$3
+    [ -f "$scenario/info-$token.sleep" ] && sleep "$(cat "$scenario/info-$token.sleep")"
+    if [ ! -f "$scenario/info-$token.json" ]; then
+      printf 'Error: Cask %s is unavailable\n' "$token" >&2
+      exit 1
+    fi
+    cat "$scenario/info-$token.json"
+    exit "$(status_of "info-$token")"
+    ;;
+  "upgrade --cask "*)
+    token=$3
+    record "brew $* NO_UPGRADE_QUIT_CASKS=${HOMEBREW_NO_UPGRADE_QUIT_CASKS:-unset}"
+    mode=moved
+    [ -f "$scenario/upgrade-$token" ] && mode=$(cat "$scenario/upgrade-$token")
+    [ -f "$scenario/upgrade-$token.sleep" ] && sleep "$(cat "$scenario/upgrade-$token.sleep")"
+    case $mode in
+      fail) exit 1 ;;
+      fail-vanish)
+        app=$(cat "$scenario/upgrade-$token.app")
+        mv "$app" "$state/removed-by-rollback-$token" || exit 1
+        exit 1
+        ;;
+      unchanged) exit 0 ;;
+      vanish)
+        app=$(cat "$scenario/upgrade-$token.app")
+        mv "$app" "$app.vanished-by-test" || exit 1
+        exit 0
+        ;;
+      moved)
+        app=$(cat "$scenario/upgrade-$token.app")
+        version=$(cat "$scenario/upgrade-$token.version")
+        if link_conflict "$token" "$@"; then
+          mv "$app" "$state/removed-by-rollback-$token" || exit 1
+          exit 1
+        fi
+        plutil -replace CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist" || exit 1
+        relink "$token" "$@" || exit 1
+        : > "$state/upgrade-finished-$token"
+        exit 0
+        ;;
+    esac
+    ;;
+  "install --cask --adopt --no-binaries "*)
+    record "brew $*"
+    : > "$state/adopted-$5"
+    exit "$(status_of adopt)"
+    ;;
+  *) unexpected "$@" ;;
+esac
+exit 0

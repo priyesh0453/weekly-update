@@ -1,0 +1,36 @@
+#!/bin/bash
+# launchctl: a test double that keeps one marker file per loaded label. A
+# label the person disabled has a .disabled- marker, and bootstrap refuses it
+# until enable runs, as launchd does, so install must enable before it loads.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+printf 'launchctl %s\n' "$*" >> "$state/calls.log"
+case ${1:-} in
+  print)
+    [ -f "$state/launchd/${2##*/}" ] || exit 113
+    printf 'state = not running\n'
+    program=$(cat "$state/launchd/${2##*/}")
+    [ -z "$program" ] || printf '\tprogram = %s\n' "$program"
+    ;;
+  bootstrap)
+    [ ! -f "$state/scenario/launchctl.sleep" ] || sleep "$(cat "$state/scenario/launchctl.sleep")"
+    [ ! -f "$state/scenario/launchctl.bootstrap-fails" ] || exit 5
+    label=$(plutil -extract Label raw -o - "$3" 2>/dev/null) || exit 5
+    [ ! -f "$state/launchd/.disabled-$label" ] || exit 5
+    plutil -extract ProgramArguments.0 raw -o - "$3" > "$state/launchd/$label" 2>/dev/null || : > "$state/launchd/$label"
+    ;;
+  enable)
+    label=${2##*/}
+    [ ! -f "$state/launchd/.disabled-$label" ] || mv "$state/launchd/.disabled-$label" "$state/launchd/.enabled-$label"
+    ;;
+  bootout)
+    label=${2##*/}
+    [ -f "$state/launchd/$label" ] || exit 3
+    mv "$state/launchd/$label" "$state/launchd/.booted-out-$label"
+    ;;
+  *)
+    printf 'UNEXPECTED launchctl %s\n' "$*" >> "$state/calls.log"
+    exit 97
+    ;;
+esac
+exit 0

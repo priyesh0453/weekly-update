@@ -1,0 +1,21 @@
+#!/bin/bash
+# sudo: a test double that never escalates. -v and -n answer from the
+# scenario; anything else is recorded and run as the same user, so it reaches
+# the other test doubles on PATH.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+scenario=$state/scenario/sudo
+case "$*" in
+  -v)
+    printf 'sudo -v\n' >> "$state/calls.log"
+    if [ -f "$scenario/v.status" ]; then exit "$(cat "$scenario/v.status")"; fi
+    exit 0
+    ;;
+  "-n true")
+    printf 'sudo -n true\n' >> "$state/calls.log"
+    if [ -f "$scenario/n.status" ]; then exit "$(cat "$scenario/n.status")"; fi
+    exit 1
+    ;;
+esac
+printf 'sudo %s\n' "$*" >> "$state/calls.log"
+exec "$@"

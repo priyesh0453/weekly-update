@@ -1,0 +1,8 @@
+# Denylist for bin/weekly-update-verify, which only reads. Same normalization
+# as rules/runtime.rules; CP means command position.
+
+deny write-or-delete (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?(rm|rmdir|unlink|srm|shred|truncate|dd|mv|cp|ditto|install|rsync|ln|touch|mkdir|chmod|chown|chflags|xattr|tmutil|diskutil|killall|pkill|kill|tee)([[:space:]]|$)
+deny run-elsewhere (^|[;&|(`{]|\$\()[[:space:]]*(sudo|env|python|python3|perl|ruby|node|xargs|git|curl|wget|nc|ssh|scp|brew|softwareupdate|osascript|open|launchctl|defaults|pmset|caffeinate)([[:space:]]|$)
+deny eval (^|[^[:alnum:]_])eval([[:space:]]|$)
+deny clobber >\|
+deny in-place (^|[^[:alnum:]_])(sed|perl|ruby)([[:space:]]+[^[:space:]]+)*[[:space:]]+-[A-Za-z]*i

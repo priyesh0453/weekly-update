@@ -1,0 +1,36 @@
+# Denylist for bin/weekly-update, read by bin/weekly-update-verify through
+# lib/gate.sh. Lines are normalized first: whole-line comments become blank,
+# /usr/bin/ /bin/ /usr/sbin/ /sbin/ prefixes are removed, and shell keywords in
+# command position (if, then, !, command, exec, ...) are removed, so "/bin/rm",
+# "if rm" and "command rm" all look like "rm".
+#
+# CP below means command position: line start, or after ; & | ( { ` or $(.
+
+deny delete-or-move (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?(rm|rmdir|unlink|srm|shred|truncate|dd|mv|cp|ditto|install|rsync|ln|chmod|chown|chflags|xattr|tmutil|diskutil|fdesetup|nvram|csrutil|systemsetup|networksetup|shutdown|reboot|halt|killall|pkill|kill)([[:space:]]|$)
+deny interpreter (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?(env|printenv|python|python3|perl|ruby|node|bash -c|sh -c|zsh -c|xargs|git|curl|wget|nc|ssh|scp|source)([[:space:]]|$)
+deny eval (^|[^[:alnum:]_])eval([[:space:]]|$)
+deny brew-variable \$\{?BREW\}?([^_[:alnum:]]|$)
+deny clobber >\|
+deny trace set -x|export -p|declare -p
+deny defaults-write defaults[[:space:]]+(write|delete|import|rename)
+deny plutil-edit plutil[[:space:]]+-(convert|replace|remove|insert|create)
+deny find-delete find[[:space:]].*-(delete|exec)
+deny in-place (^|[^[:alnum:]_])(sed|perl|ruby)([[:space:]]+[^[:space:]]+)*[[:space:]]+-[A-Za-z]*i
+deny dangerous-flag --(force|user|stdinpass|all|recommended|os-only|ignore|reset-ignored|greedy|zap)([^[:alnum:]-]|$)
+deny launchctl-change (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?launchctl[[:space:]]+(bootout|bootstrap|remove|unload|load|kickstart|enable|disable|kill|submit|setenv)
+deny tee (^|[^[:alnum:]_-])tee([[:space:]]|$)
+allow tee tee -a
+deny brew-verb (^|[^[:alnum:]_./-])brew[[:space:]]+[a-z-]+
+allow brew-verb brew[[:space:]]+(update|outdated --cask|upgrade --cask|install --cask --adopt|info --cask|--version|--prefix|--caskroom|--cache)([[:space:]]|"|\)|$)
+deny brew-path /opt/homebrew|/usr/local
+allow brew-path ^[[:space:]]*(\[ -x (/opt/homebrew|/usr/local)/bin/brew \]; then|BREW_BIN=(/opt/homebrew|/usr/local)/bin)[[:space:]]*$
+deny softwareupdate-all softwareupdate[^#]*[[:space:]]-(a|r|-all|-recommended)([[:space:]]|$)
+deny osascript (^|[;&|(`{]|\$\()[[:space:]]*osascript
+allow osascript ^[[:space:]]*osascript -e "display notification \\"\$message\\" with title \\"weekly-update\\""
+allow osascript ^[[:space:]]*osascript -e "tell application id \\"\$bundle\\" to quit"
+deny open (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?open([[:space:]]|$)
+allow open ^[[:space:]]*open -a Terminal "\$SHIM" 
+allow open ^[[:space:]]*open -b "\$bundle" 
+allow open ^[[:space:]]*open "\$SOFTWARE_UPDATE_PANE" 
+deny pmset-change (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?pmset[[:space:]]+-[^g]
+deny caffeinate (^|[;&|(`{]|\$\()[[:space:]]*caffeinate

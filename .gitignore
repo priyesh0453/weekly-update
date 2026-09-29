@@ -1,0 +1,7 @@
+# Local editor and OS litter
+.DS_Store
+*.swp
+*~
+# Test sandboxes are created under $TMPDIR, never in the tree; this catches a
+# run with TMPDIR pointed at the repo by mistake.
+wu-test.*/

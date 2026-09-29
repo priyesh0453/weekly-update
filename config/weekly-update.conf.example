@@ -1,0 +1,235 @@
+# weekly-update config, example. I wrote it to be copied: every live value
+# below is the built-in default, and every [app] block is commented out, so a
+# copy of this file as it stands changes nothing and confirms nothing.
+#
+# How to adapt this:
+#   mkdir -p ~/.config/weekly-update
+#   cp config/weekly-update.conf.example ~/.config/weekly-update/config
+# In the copy, change the [updater] values you disagree with, uncomment one
+# [app] block per app you want managed, and put your own app's bundle id in
+# place of each com.example placeholder. Setup can write the cask lines
+# instead: it proposes a cask for each Dock app it can match and appends a
+# block for each one you confirm. Then run
+#   ./bin/weekly-update check
+# which reads the file and reports without changing anything: a wrong value
+# stops it with the line number, and the Dock table shows what each app gets.
+# A changed schedule takes effect once ./install.sh runs again, because the
+# LaunchAgent is rendered from this file at install time. The file itself is
+# optional: with no file, the tool uses the defaults shown here.
+#
+# Format: a line whose first non-blank character is # is a comment. [kind] or
+# [kind name] opens a section. key = value; the value is the rest of the line,
+# trimmed and taken literally (quotes are kept, # after a value is part of it).
+# A number is a whole number without a leading zero. An unknown key, a bad
+# value or a typo stops every mode except help, --help and --version with the
+# file name and line number, and nothing runs on a half-read config (exit
+# status 2).
+#
+# The config can confirm apps, demote an app to vendor or manual, and tune the
+# schedule, the battery floor, the deadlines and the number of nudges. It
+# cannot make the unattended pass quit an app, call sudo, or start at load.
+
+[updater]
+# The LaunchAgent label is <label_prefix>.weekly-update. Allowed: 1 to 200
+# characters of ASCII letters, digits, dots and hyphens, starting with a
+# letter or digit. Default: local.<your login name>, with any other byte of
+# the login name turned into - (local.user when no login name can be read).
+# I leave it unset, because the default is already unique to this account
+# and I keep no other LaunchAgents to sort it with; set it when yours share
+# one reverse-domain prefix and you want this one listed beside them.
+# label_prefix = com.example
+
+# When the slots run: one slot per hour from first_hour to last_hour, each at
+# minute, on weekday. weekday is 0 to 6 with 0 for Sunday, default 0.
+# first_hour and last_hour are 0 to 23, defaults 14 and 21, and last_hour
+# must be later than first_hour so a day has at least two slots. minute is
+# 0 to 59, default 0. Slots the Mac sleeps through run as one slot at its
+# next wake, whatever the day or hour. I spread the slots over a Sunday
+# afternoon and evening because the first ones often find the Mac asleep or
+# me away: a slot upgrades closed, confirmed apps on its own, and the work
+# that needs me waits for a later slot that finds me at the Mac. A window
+# closer to your own habits, say weekday = 6 with first_hour = 9 and
+# last_hour = 13, is the same idea.
+weekday = 0
+first_hour = 14
+last_hour = 21
+minute = 0
+
+# On battery power below this percentage nothing is replaced and the slot
+# defers, so a later slot retries: 20 to 100, default 20. The floor exists
+# for one failure, a power loss in the middle of replacing an app, which has
+# no way back. I keep the lowest value allowed, because at 20 percent a
+# laptop still has the minutes an upgrade takes; raise it if your battery
+# drains faster than you trust.
+battery_floor = 20
+
+# Seconds an app gets to quit its own way after an interactive pass, with
+# your yes, asks it to; past this it is left running and unchanged. Allowed
+# 10 to 600, default 120. The unattended pass never quits an app, so the
+# value never matters while nobody is watching. I keep two minutes because
+# the request goes through the app's own quit, so unsaved work gets its save
+# dialog, and I want time to see it; shorten it if you always answer at once.
+quit_wait = 120
+
+# Seconds the window a slot opens waits for your answer to "Run the weekly
+# update now?": 60 to 86400, default 14400, four hours. No, closing the
+# window and the timeout all change nothing, but each counts as an answer:
+# later slots stand down until the next slot day, so a window you never saw
+# is a week skipped. I keep four hours so a window that opens while I am
+# away from the desk is still waiting when I return; set 86400 to keep it
+# for a whole day.
+entry_wait = 14400
+
+# Opening an app so its own updater fetches is retired for that app after
+# this many attempts that left its version where it was: 1 to 10, default 2.
+# I keep 2 because one attempt can fail for a reason unrelated to the app,
+# such as no network at that moment, and a third would only repeat the
+# second. A retired app is still reported: update it from inside the app,
+# or it catches up at its next release.
+nudge_give_up = 2
+
+# Deadlines in seconds, each 5 to 3600. index_timeout, default 300, is for
+# the Homebrew index refresh: past it an unattended slot defers, because
+# nothing is decided on stale data (the Mac usually woke without a network),
+# while an interactive pass goes on with the cached index and reports it.
+# query_timeout, default 120, is for each Homebrew query; a cask whose entry
+# cannot be read in time is left alone this run. list_timeout, default 300,
+# is for the macOS update listing; past it the macOS step reports a failure.
+# I keep the defaults because they are generous on a home connection, and a
+# deadline that is too short turns one slow answer into a deferred slot.
+index_timeout = 300
+query_timeout = 120
+list_timeout = 300
+
+# Homebrew upgrades and adoptions have no deadline, because stopping one
+# part-way is the unsafe way to fail; instead a warning repeats every
+# slow_warn seconds while one runs: 60 to 86400, default 1800. I keep half
+# an hour because a normal upgrade ends long before that, so a warning means
+# something is stuck, a stalled download or a password prompt waiting, and
+# a shorter interval would only fill the log.
+slow_warn = 1800
+
+# Seconds the "Press Return to close this window" prompt after a window pass
+# stays open before the window closes itself: 10 to 3600, default 600. The
+# pass is over by then and the lock is released, so the value only decides
+# how long the summary stays readable. I keep ten minutes; set 3600 if you
+# want the window to wait for you.
+final_prompt_timeout = 600
+
+# Warn when no pass has finished for this many days: 2 to 60, default 8. The
+# schedule is weekly, so 8 catches one missed week and stays quiet in the
+# normal case; an unattended slot also sends a notification when it fires
+# with no pass row for the day. Use a larger value if you leave the Mac off
+# for weeks at a time.
+heartbeat_days = 8
+
+# Shown when this account is not an administrator, in place of the default
+# "This account is not an administrator, and installing macOS updates needs
+# one. macOS installs are skipped this run." Any text that is not blank. I
+# leave the default; write here how rights are granted on your Mac, for
+# example who to ask.
+# admin_hint = Ask the owner of this Mac to install macOS updates.
+
+# One [app BUNDLE_ID] section per app you want managed, named by its bundle
+# id: letters, digits, dots and hyphens, starting with a letter or digit.
+# Find one with: osascript -e 'id of app "Firefox"'. A section needs cask or
+# group; the other keys are optional.
+#
+#   cask = TOKEN            the Homebrew cask that manages it; this confirms
+#                           the app. Lowercase letters, digits and @ . _ + -,
+#                           starting with a letter or digit, as brew names
+#                           it. No default.
+#   group = vendor|manual   vendor: its maker updates it in the background,
+#                           so the tool leaves it alone and never proposes a
+#                           cask. manual: you update it from inside the app;
+#                           Homebrew never upgrades it. Default: worked out
+#                           from the cask (silent or assisted), manual when
+#                           there is no cask, system for Apple's own apps.
+#   also_matches = ID ...   other bundle ids a Dock tile may carry for this
+#                           app, separated by spaces. Default: none.
+#   open_as = ID            the bundle id the tool asks to quit and opens,
+#                           when it is not the tile's own. Default: the
+#                           tile's id.
+#   open_warning = TEXT     printed before an interactive pass asks whether
+#                           to open this app so its own updater fetches.
+#                           Default: nothing.
+#   version_drop_leading = N  leading parts of the installed version to drop
+#                           before comparing with the index, for an app whose
+#                           bundle version carries a prefix the index does
+#                           not: 0 to 3, default 0.
+#
+# Apps found automatically (casks Homebrew already manages, or a cask name
+# that matches the app) are only reported until you confirm them here, by
+# hand or with: ~/.local/share/weekly-update/app/bin/weekly-update setup
+
+# Worked examples, commented out so a copy of this file confirms nothing.
+# Uncomment only the blocks for apps you want managed: a cask line confirms
+# the app, and a confirmed app may be upgraded unattended when it is closed.
+# The com.example ids are placeholders for the ids of your own apps.
+
+# The plain case: the cask name is all the tool needs, and I want these
+# upgraded unattended while they are closed.
+# [app org.mozilla.firefox]
+# cask = firefox
+
+# [app com.microsoft.VSCode]
+# cask = visual-studio-code
+
+# [app dev.zed.Zed]
+# cask = zed
+
+# Apps whose maker updates them in the background. I list them so setup
+# stops proposing a cask for them and check stops listing them under "No
+# cask found".
+# [app com.google.Chrome]
+# group = vendor
+
+# [app us.zoom.xos]
+# group = vendor
+
+# also_matches: the tool finds an app's section by the bundle id the Dock
+# stored for its tile, and a tile can carry an id other than the one I named
+# the section by, such as a helper's id or an id the app no longer uses.
+# Without this line such a tile counts as an app I never confirmed. List
+# every id the tile may carry, separated by spaces.
+# [app com.example.browser]
+# cask = example-browser
+# also_matches = com.example.browser.helper
+
+# open_as: the tool asks an app to quit, and opens it again, by bundle id,
+# and by default uses the id the Dock tile carries. I set it for an app
+# whose tile carries one id while the process that must quit, and the app
+# that must open, answer to another; without it the quit request goes to
+# the wrong id, the wait runs out at quit_wait, and the upgrade is skipped.
+# [app com.example.suite]
+# cask = example-suite
+# open_as = com.example.suite.main
+
+# open_warning: an interactive pass may open a closed app that is behind its
+# index so its own updater fetches, after asking me. This text is printed
+# with the app's name before that question, so I remember what opening this
+# one does before I answer. Write what you would want to be told: a browser
+# restores its last session, some apps put up a login prompt.
+# [app com.example.editor]
+# cask = example-editor
+# open_warning = Opening it restores every window from last time
+
+# version_drop_leading: this app reports one more leading version part than
+# the Homebrew index (129.1.2.3 installed against 1.2.3 in the index), so I
+# drop one part before comparing. With 0 the first parts are compared as
+# they stand, 129 against 1, and the app reads as newer than the index, so
+# check cannot say when it is behind and an interactive pass never offers
+# to open it. The installed version must have exactly N more parts than the
+# index version, or the comparison reads as unordered.
+# [app com.example.tool]
+# cask = example-tool
+# version_drop_leading = 1
+
+# group = manual: I update this app from inside itself, because its own
+# updater is ahead of the cask. Homebrew never upgrades it, in any mode.
+# With the cask line kept, check still compares it with the index and says
+# when it is behind, and an interactive pass may offer to open it. Drop the
+# cask line and it is only listed, and setup stops proposing a cask for it.
+# [app com.example.notes]
+# cask = example-notes
+# group = manual

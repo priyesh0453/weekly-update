@@ -1,0 +1,40 @@
+#!/bin/bash
+# softwareupdate: a test double. --list prints the scenario's saved listing,
+# or no new software; --install and --download only record the call, and an
+# install with a restart also records how many restart requests the history
+# held, so a test can show the request was on record before the install ran.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+scenario=$state/scenario/softwareupdate
+record() { printf '%s\n' "$*" >> "$state/calls.log"; }
+history_file=$HOME/Library/Logs/weekly-update/history.tsv
+case ${1:-} in
+  --list)
+    record "softwareupdate $*"
+    [ -f "$scenario/list.sleep" ] && sleep "$(cat "$scenario/list.sleep")"
+    if [ -f "$scenario/list.txt" ]; then cat "$scenario/list.txt"; else printf 'Software Update Tool\n\nFinding available software\nNo new software available.\n'; fi
+    exit 0
+    ;;
+  --install)
+    case " $* " in
+      *" --restart "*)
+        rows=$(awk -F'\t' '$3 == "restart-requested"' "$history_file" 2>/dev/null | wc -l | tr -d ' ')
+        record "softwareupdate $* restart-rows-before-call=$rows"
+        ;;
+      *) record "softwareupdate $*" ;;
+    esac
+    if [ -f "$scenario/install.status" ]; then exit "$(cat "$scenario/install.status")"; fi
+    exit 0
+    ;;
+  --download)
+    record "softwareupdate $*"
+    exit 0
+    ;;
+  --history)
+    record "softwareupdate $*"
+    printf 'Display Name                                       Version    Date\n'
+    exit 0
+    ;;
+esac
+record "UNEXPECTED softwareupdate $*"
+exit 97

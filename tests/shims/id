@@ -1,0 +1,17 @@
+#!/bin/bash
+# id: a test double. -u answers 501, or 0 when the scenario marks root; -un
+# answers tester, or the scenario's login file; -Gn lists admin unless the
+# scenario marks not-admin. Each knob drives one refusal or default the tests
+# exercise: the root stop, the default label and the administrator check.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+printf 'id %s\n' "$*" >> "$state/calls.log"
+case "$*" in
+  -u) if [ -f "$state/scenario/id/root" ]; then printf '0\n'; else printf '501\n'; fi ;;
+  -un) if [ -f "$state/scenario/id/login" ]; then cat "$state/scenario/id/login"; else printf 'tester\n'; fi ;;
+  -Gn)
+    if [ -f "$state/scenario/id/not-admin" ]; then printf 'staff everyone\n'; else printf 'staff everyone admin\n'; fi
+    ;;
+  *) printf 'UNEXPECTED id %s\n' "$*" >> "$state/calls.log"; exit 97 ;;
+esac
+exit 0

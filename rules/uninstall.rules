@@ -1,0 +1,14 @@
+# Denylist for bin/weekly-update-uninstall: it may make the log folder for its
+# run lock and a dated folder, unload its own schedule and move its own files
+# into that folder, and nothing else. Same normalization as rules/runtime.rules;
+# CP means command position.
+
+deny delete (^|[;&|(`{]|\$\()[[:space:]]*(sudo[[:space:]]+)?(rm|rmdir|unlink|srm|shred|truncate|dd|cp|ditto|install|rsync|ln|chmod|chown|chflags|xattr|killall|pkill|kill|tee)([[:space:]]|$)
+deny run-elsewhere (^|[;&|(`{]|\$\()[[:space:]]*(sudo|env|python|python3|perl|ruby|node|xargs|git|curl|wget|nc|ssh|scp|brew|softwareupdate|osascript|open|defaults|pmset)([[:space:]]|$)
+deny eval (^|[^[:alnum:]_])eval([[:space:]]|$)
+deny clobber >\|
+deny launchctl-change (^|[;&|(`{]|\$\()[[:space:]]*launchctl[[:space:]]+(bootout|bootstrap|remove|unload|load|kickstart|enable|disable|kill|submit|setenv)
+allow launchctl-change launchctl bootout "gui/\$USER_ID/\$LABEL" 
+deny move (^|[;&|(`{]|\$\()[[:space:]]*mv[[:space:]]
+allow move ^[[:space:]]*mv "\$PLIST" "\$DEST/";
+allow move ^[[:space:]]*mv "\$APP" "\$DEST/app";

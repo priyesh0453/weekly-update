@@ -1,0 +1,416 @@
+#!/bin/bash
+# weekly-update-uninstall: unloads the schedule and moves the installed copy
+# and its LaunchAgent into a dated folder, then checks that they are gone.
+# Nothing is deleted: logs, history and your config stay where they are, and
+# the moved files can be put back by hand. --dry-run prints the plan only.
+# shellcheck source-path=SCRIPTDIR
+set -u
+set -o pipefail
+set -o noclobber
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+case ${HOME:-} in
+  /*) ;;
+  *)
+    printf '%s: HOME must be an absolute path\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac
+# A trailing slash would put "//" into every path below.
+while :; do
+  case $HOME in
+    ?*/) HOME=${HOME%/} ;;
+    *) break ;;
+  esac
+done
+export HOME
+
+SHIMMED_TOOLS="softwareupdate osascript defaults pmset launchctl open sudo caffeinate sw_vers id pgrep brew"
+
+# Nothing outside this function reads WU_TEST*. The sandbox rules are the
+# runtime's.
+apply_test_seams() {
+  local tool found home_real root_real
+  [ -n "${WU_TEST:-}" ] || return 0
+  if [ "$WU_TEST" != 1 ] || [ -z "${WU_TEST_ROOT:-}" ] || [ ! -f "$WU_TEST_ROOT/.weekly-update-test-root" ]; then
+    printf 'weekly-update-uninstall: test seams requested outside a sandbox\n' >&2
+    exit 2
+  fi
+  home_real=$(cd "$HOME" 2>/dev/null && pwd -P)
+  root_real=$(cd "$WU_TEST_ROOT" 2>/dev/null && pwd -P)
+  case $home_real/ in
+    "$root_real"/?*) ;;
+    *)
+      printf 'weekly-update-uninstall: test seams requested outside a sandbox (HOME is not under the test root)\n' >&2
+      exit 2
+      ;;
+  esac
+  if [ -z "${WU_TEST_SHIMS:-}" ] || [ ! -d "$WU_TEST_SHIMS" ]; then
+    printf 'weekly-update-uninstall: test seams need WU_TEST_SHIMS\n' >&2
+    exit 2
+  fi
+  export PATH="$WU_TEST_SHIMS:/usr/bin:/bin:/usr/sbin:/sbin"
+  for tool in $SHIMMED_TOOLS; do
+    found=$(command -v "$tool" 2>/dev/null)
+    if [ "$found" != "$WU_TEST_SHIMS/$tool" ]; then
+      printf 'weekly-update-uninstall: test seams refused: %s resolves to %s, not to the shim directory\n' "$tool" "${found:-nothing}" >&2
+      exit 2
+    fi
+  done
+  return 0
+}
+
+apply_test_seams
+
+case $0 in
+  */*) SELF_DIR=$(CDPATH='' cd -P -- "${0%/*}" 2>/dev/null && pwd -P) ;;
+  *) SELF_DIR=$(CDPATH='' cd -P -- "$(dirname "$(command -v "$0")")" 2>/dev/null && pwd -P) ;;
+esac
+LIB_DIR=${SELF_DIR%/*}/lib
+unset _UTIL_SH_LOADED _TERM_SH_LOADED _REPORT_SH_LOADED _LIFECYCLE_SH_LOADED
+REPORT_RUN_LOG=""
+REPORT_HISTORY_FILE=""
+REPORT_MODE=uninstall
+LIFECYCLE_ABORT_HOOK=""
+# shellcheck source=../lib/util.sh
+. "$LIB_DIR/util.sh" || exit 2
+# shellcheck source=../lib/report.sh
+. "$LIB_DIR/report.sh" || exit 2
+# shellcheck source=../lib/term.sh
+. "$LIB_DIR/term.sh" || exit 2
+# shellcheck source=../lib/lifecycle.sh
+. "$LIB_DIR/lifecycle.sh" || exit 2
+
+TOOL_HOME=$HOME/.local/share/weekly-update
+APP=$TOOL_HOME/app
+MANIFEST=$APP/install-manifest.tsv
+LOG_DIR=$HOME/Library/Logs/weekly-update
+CONFIG_FILE=$HOME/.config/weekly-update/config
+LAUNCH_AGENTS=$HOME/Library/LaunchAgents
+DEST_BASE=$TOOL_HOME/removed-$(date '+%Y%m%d-%H%M%S')
+# A folder of its own for this run, made with mkdir so it cannot already hold
+# an earlier run's files, even one that started in the same second.
+fresh_folder() {
+  local base=$1 n=1
+  FRESH=$base
+  until mkdir -- "$FRESH" 2>/dev/null; do
+    [ -e "$FRESH" ] || [ -L "$FRESH" ] || return 1
+    n=$((n + 1))
+    FRESH=$base-$n
+  done
+}
+# The plan must create nothing, so this only predicts the name fresh_folder
+# would pick now.
+free_name() {
+  local base=$1 n=1
+  FRESH=$base
+  while [ -e "$FRESH" ] || [ -L "$FRESH" ]; do
+    n=$((n + 1))
+    FRESH=$base-$n
+  done
+}
+RUNTIME_SUFFIX=/.local/share/weekly-update/app/bin/weekly-update
+HOME_FLAT=$(printf '%s' "$HOME" | sed 's#//*#/#g')
+HOME_REAL=$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P)
+# A program is this tool's runtime when its home part is this home folder,
+# with doubled slashes or through a symlink: a LaunchAgent written while HOME
+# was spelled that way records the runtime under that spelling.
+is_our_program() {
+  local program prefix
+  program=$(printf '%s' "$1" | sed 's#//*#/#g')
+  case $program in
+    *"$RUNTIME_SUFFIX") prefix=${program%"$RUNTIME_SUFFIX"} ;;
+    *) return 1 ;;
+  esac
+  [ -n "$prefix" ] || prefix=/
+  case $prefix in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ "$prefix" = "$HOME_FLAT" ] && return 0
+  [ -n "$HOME_REAL" ] && [ "$(CDPATH='' cd -P -- "$prefix" 2>/dev/null && pwd -P)" = "$HOME_REAL" ]
+}
+# The owner is ours, unread, lookalike or other. A lookalike is this tool's
+# runtime path under a home folder that cannot be matched to this one, such as
+# a renamed one, so it may still be this tool's.
+program_owner() {
+  if is_our_program "$1"; then
+    printf 'ours'
+  elif [ -z "$1" ]; then
+    printf 'unread'
+  else
+    case $(printf '%s' "$1" | sed 's#//*#/#g') in
+      *"$RUNTIME_SUFFIX") printf 'lookalike' ;;
+      *) printf 'other' ;;
+    esac
+  fi
+}
+DRY_RUN=0
+
+for argument in "$@"; do
+  case $argument in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help)
+      printf 'Usage: weekly-update-uninstall [--dry-run] [--help]\n'
+      printf 'Unloads the schedule and moves the installed copy and its LaunchAgent into a dated folder.\n'
+      printf 'Logs, history and your config are left in place. Nothing is deleted.\n'
+      printf '  --dry-run  print the plan; unload and move nothing\n'
+      printf '  --help     print this text (-h is the same)\n'
+      exit 0
+      ;;
+    *)
+      printf 'weekly-update-uninstall: unknown argument %s (see --help)\n' "$argument" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Under sudo, HOME stays the person's, and a root uninstall would look for the
+# schedule in root's session, not in the person's.
+if [ "$(id -u)" = 0 ]; then
+  printf 'weekly-update-uninstall: run it as the person who uses this Mac, not as root. Run it again without sudo.\n' >&2
+  exit 2
+fi
+
+# Only labels with this suffix are acted on, so a hand-edited manifest cannot
+# make the uninstaller unload an agent outside it.
+label_is_ours() {
+  case $1 in
+    .*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]*) return 1 ;;
+    ?*.weekly-update) return 0 ;;
+  esac
+  return 1
+}
+
+term_banner "WEEKLY UPDATE  .  uninstall" "unload, move aside, verify; nothing is deleted"
+
+LABEL=""
+if [ -f "$MANIFEST" ]; then
+  LABEL=$(LC_ALL=C awk -F'\t' '$1 == "label" { print $2; exit }' "$MANIFEST")
+fi
+if [ -n "$LABEL" ] && ! label_is_ours "$LABEL"; then
+  report_failure "$MANIFEST names \"$LABEL\", which is not a weekly-update label, so nothing was unloaded or moved. Look in $LAUNCH_AGENTS for a file ending in .weekly-update.plist"
+  exit 1
+fi
+USER_ID=$(id -u)
+# LABELS are unloaded unless KEEP_LOADED names them; MOVE_LABELS name the
+# LaunchAgent files that are moved. Every decision is made before anything is
+# unloaded or moved.
+LABELS=$LABEL
+MOVE_LABELS=$LABEL
+KEEP_LOADED=""
+FOREIGN=""
+UNSURE=0
+FOUND=""
+render_failed=0
+configured_label=""
+not_loaded=""
+if [ -z "$LABEL" ] && [ -e "$APP" ]; then
+  report_failure "$APP exists but has no install manifest, so the schedule label is unknown. Move $APP aside by hand, and look in $LAUNCH_AGENTS for a file ending in .weekly-update.plist"
+  exit 1
+fi
+# Every other agent with the suffix is looked at, with the manifest or
+# without: a tool folder removed by hand takes the manifest with it, and a
+# changed label_prefix leaves the old label's agent behind.
+for found_plist in "$LAUNCH_AGENTS"/*.weekly-update.plist; do
+  [ -e "$found_plist" ] || [ -L "$found_plist" ] || continue
+  [ -z "$LABEL" ] || [ "$found_plist" != "$LAUNCH_AGENTS/$LABEL.plist" ] || continue
+  # The suffix is a common name for a person's own automation, so only an
+  # agent that runs this tool's runtime is treated as this tool's.
+  if [ ! -r "$found_plist" ] || ! plutil -lint "$found_plist" >/dev/null 2>&1; then
+    report_failure "$found_plist cannot be read, so it is not known whether it belongs to this tool, and nothing was unloaded or moved. Check that file, and unload and move it by hand if it belongs to this tool"
+    exit 1
+  fi
+  found_program=$(plutil -extract ProgramArguments.0 raw -o - "$found_plist" 2>/dev/null)
+  case $(program_owner "$found_program") in
+    ours) ;;
+    lookalike)
+      report_failure "$found_plist runs $found_program, this tool's runtime path under another home folder, so it is not known whether it belongs to this tool"
+      UNSURE=1
+      continue
+      ;;
+    unread)
+      report_warning "$found_plist names no ProgramArguments this tool can read, so it was left alone"
+      FOREIGN="$FOREIGN $found_plist"
+      continue
+      ;;
+    *)
+      report_warning "$found_plist runs $found_program, not this tool, so it was left alone"
+      FOREIGN="$FOREIGN $found_plist"
+      continue
+      ;;
+  esac
+  found_label=$(plutil -extract Label raw -o - "$found_plist" 2>/dev/null)
+  found_name=${found_plist##*/}
+  if [ "$found_label" != "${found_name%.plist}" ] || ! label_is_ours "$found_label"; then
+    report_failure "$found_plist does not carry its own file name as a weekly-update label, so nothing was unloaded or moved. Check that file, and unload and move it by hand if it belongs to this tool"
+    exit 1
+  fi
+  LABELS="$LABELS $found_label"
+  MOVE_LABELS="$MOVE_LABELS $found_label"
+  FOUND="$FOUND $found_label"
+done
+# Without the manifest, a schedule stays loaded after its LaunchAgent file is
+# gone, so the label the config renders is asked about as well.
+if [ -z "$LABEL" ] && [ -f "$SELF_DIR/weekly-update" ]; then
+  if rendered_plist=$(/bin/bash "$SELF_DIR/weekly-update" plist 2>/dev/null); then
+    configured_label=$(printf '%s\n' "$rendered_plist" | plutil -extract Label raw -o - - 2>/dev/null)
+  else
+    render_failed=1
+    render_error=$(/bin/bash "$SELF_DIR/weekly-update" plist 2>&1 >/dev/null | head -n 1)
+    report_warning "The LaunchAgent could not be rendered, so a loaded schedule under the label the config names was not checked: ${render_error:-no reason was printed}"
+  fi
+fi
+check_labels=$FOUND
+if label_is_ours "$configured_label"; then
+  case " $LABELS " in
+    *" $configured_label "*) ;;
+    *) check_labels="$check_labels $configured_label" ;;
+  esac
+fi
+# Whose a loaded schedule is comes from launchd, not from the file at its
+# label path, because either can change without the other.
+for check_label in $check_labels; do
+  if ! loaded_info=$(launchctl print "gui/$USER_ID/$check_label" 2>/dev/null); then
+    [ "$check_label" != "$configured_label" ] || not_loaded=", and the schedule $configured_label is not loaded"
+    continue
+  fi
+  loaded_program=$(printf '%s\n' "$loaded_info" | sed -n 's/^[[:space:]]*program = //p' | head -n 1)
+  case $(program_owner "$loaded_program") in
+    ours)
+      case " $LABELS " in
+        *" $check_label "*) ;;
+        *) LABELS="$LABELS $check_label" ;;
+      esac
+      ;;
+    unread)
+      report_failure "The schedule $check_label is loaded, but launchctl names no program for it that this tool can read, so it is not known whether it belongs to this tool"
+      UNSURE=1
+      ;;
+    lookalike)
+      report_failure "The schedule $check_label is loaded and runs $loaded_program, this tool's runtime path under another home folder, so it is not known whether it belongs to this tool"
+      UNSURE=1
+      ;;
+    *)
+      report_warning "The schedule $check_label is loaded but runs $loaded_program, not this tool, so it was left alone"
+      KEEP_LOADED="$KEEP_LOADED $check_label"
+      ;;
+  esac
+done
+if [ "$UNSURE" = 1 ]; then
+  report_failure "Nothing was unloaded or moved. Check what the lines above name; if one belongs to this tool, unload and move it by hand (Uninstall in the README shows how)"
+  exit 1
+fi
+if [ -z "$LABEL" ]; then
+  if [ -z "$LABELS" ] && [ "$render_failed" = 1 ]; then
+    report_failure "Whether a schedule is still loaded is not known, because the LaunchAgent could not be rendered (the warning above says why), so nothing was unloaded or moved. Fix what it names (./bin/weekly-update check names a config line), or unload by hand after launchctl list | grep weekly-update, then rerun"
+    exit 1
+  fi
+  if [ -z "$LABELS" ]; then
+    report_success "Nothing is installed: no tool copy at $APP and none of this tool's LaunchAgents in $LAUNCH_AGENTS$not_loaded"
+    exit 0
+  fi
+  report_warning "No tool copy at $APP, but a weekly-update schedule is still here; the uninstaller treats it like an installed one"
+fi
+is_kept_loaded() {
+  case " $KEEP_LOADED " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+# Every label passed label_is_ours, so it holds no blank or pattern character.
+for LABEL in $LABELS; do
+  if is_kept_loaded "$LABEL"; then
+    report_detail "Schedule:    $LABEL stays loaded, because it runs another program"
+  else
+    report_detail "Schedule:    $LABEL"
+  fi
+done
+for LABEL in $MOVE_LABELS; do
+  report_detail "LaunchAgent: $LAUNCH_AGENTS/$LABEL.plist"
+done
+if [ -e "$APP" ]; then
+  report_detail "Tool copy:   $APP"
+else
+  report_detail "Tool copy:   none at $APP"
+fi
+free_name "$DEST_BASE"
+DEST=$FRESH
+report_detail "Moved to:    $DEST"
+if [ "$DRY_RUN" = 1 ]; then
+  printf '\n  Dry run: nothing was unloaded or moved.\n\n'
+  exit 0
+fi
+
+log_dir_existed=no
+[ ! -d "$LOG_DIR" ] || log_dir_existed=yes
+mkdir -p "$LOG_DIR" || { report_failure "Cannot create $LOG_DIR for the run lock"; exit 1; }
+lifecycle_take_lock "$LOG_DIR/run.lock"
+if [ "$?" -eq 75 ]; then
+  report_failure "A weekly-update pass is running right now; rerun the uninstaller when it finishes"
+  exit 1
+fi
+
+# The folder comes first, so a tool folder that cannot hold it leaves every
+# schedule loaded and every file in place.
+if ! mkdir -p "$TOOL_HOME" || ! fresh_folder "$DEST_BASE"; then
+  report_failure "Cannot create a folder under $TOOL_HOME to move the files into; nothing was unloaded or moved"
+  exit 1
+fi
+DEST=$FRESH
+
+for LABEL in $LABELS; do
+  ! is_kept_loaded "$LABEL" || continue
+  if launchctl print "gui/$USER_ID/$LABEL" >/dev/null 2>&1; then
+    if launchctl bootout "gui/$USER_ID/$LABEL" >/dev/null 2>&1; then
+      report_success "Schedule unloaded: $LABEL"
+    else
+      report_failure "launchctl could not unload $LABEL"
+    fi
+  else
+    report_detail "The schedule $LABEL was not loaded"
+  fi
+done
+for LABEL in $MOVE_LABELS; do
+  PLIST=$LAUNCH_AGENTS/$LABEL.plist
+  if [ -e "$PLIST" ] || [ -L "$PLIST" ]; then
+    if mv "$PLIST" "$DEST/"; then report_success "LaunchAgent moved to $DEST/"; else report_failure "Could not move $PLIST"; fi
+  fi
+done
+if [ -e "$APP" ]; then
+  if mv "$APP" "$DEST/app"; then report_success "Tool copy moved to $DEST/app"; else report_failure "Could not move $APP"; fi
+fi
+
+LEFTOVERS=""
+for LABEL in $LABELS; do
+  ! is_kept_loaded "$LABEL" || continue
+  if launchctl print "gui/$USER_ID/$LABEL" >/dev/null 2>&1; then LEFTOVERS="$LEFTOVERS schedule-still-loaded($LABEL)"; fi
+done
+for LABEL in $MOVE_LABELS; do
+  PLIST=$LAUNCH_AGENTS/$LABEL.plist
+  if [ -e "$PLIST" ] || [ -L "$PLIST" ]; then LEFTOVERS="$LEFTOVERS $PLIST"; fi
+done
+[ ! -e "$APP" ] || LEFTOVERS="$LEFTOVERS $APP"
+printf '\n'
+[ "$log_dir_existed" = no ] || printf '  Logs and history kept:  %s\n' "$LOG_DIR"
+if [ -e "$CONFIG_FILE" ]; then
+  printf '  Config kept:            %s\n' "$CONFIG_FILE"
+else
+  printf '  Config:                 none at %s\n' "$CONFIG_FILE"
+fi
+printf '  Moved files:            %s\n' "$DEST"
+if [ -n "$LEFTOVERS" ]; then
+  printf '\n  NOT fully removed; still present:%s\n\n' "$LEFTOVERS"
+  exit 1
+fi
+if [ -n "$FOREIGN" ]; then
+  printf '\n  Left in place, for the reasons named above:%s\n' "$FOREIGN"
+fi
+if [ -n "$KEEP_LOADED" ]; then
+  printf '\n  Left loaded, because it runs another program:%s\n' "$KEEP_LOADED"
+fi
+if [ "$render_failed" = 1 ]; then
+  printf '\n  NOT fully verified: the LaunchAgent could not be rendered, so a schedule loaded under the label the config names was not checked (the warning above says why).\n\n'
+  exit 1
+fi
+printf '\n  Removed and verified: this tool'\''s schedule is not loaded, and this tool'\''s LaunchAgent and the tool copy are gone from their places.\n\n'
+exit 0

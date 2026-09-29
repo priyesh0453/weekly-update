@@ -1,0 +1,14 @@
+#!/bin/bash
+# defaults: a test double. A read answers from the scenario folder; anything
+# else is logged as UNEXPECTED and exits 97, so a write by the tool under test
+# shows up as a failed scenario, never as a changed preference.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+printf 'defaults %s\n' "$*" >> "$state/calls.log"
+if [ "${1:-}" = read ] && [ "$#" -eq 3 ]; then
+  [ -f "$state/scenario/defaults/$3" ] || exit 1
+  cat "$state/scenario/defaults/$3"
+  exit 0
+fi
+printf 'UNEXPECTED defaults %s\n' "$*" >> "$state/calls.log"
+exit 97

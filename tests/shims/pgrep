@@ -1,0 +1,19 @@
+#!/bin/bash
+# pgrep: a test double for pgrep -q -f PATTERN. The pattern names an app
+# bundle, and the app counts as running when a marker exists for its bundle
+# id. A scenario can make it fail as pgrep does on an error, with
+# scenario/pgrep.status. The library's keep-awake release asks which children
+# of the runtime are named caffeinate; the real pgrep answers that, because it
+# only reads the process table, and that scenario status is for the app
+# question alone.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+printf 'pgrep %s\n' "$*" >> "$state/calls.log"
+if [ "$#" = 4 ] && [ "$1" = -P ] && [ "$3" = -x ] && [ "$4" = caffeinate ]; then
+  exec /usr/bin/pgrep "$@"
+fi
+[ ! -f "$state/scenario/pgrep.status" ] || exit "$(cat "$state/scenario/pgrep.status")"
+for pattern in "$@"; do :; done
+path=$(printf '%s' "$pattern" | sed -e 's/^\^//' -e 's#/Contents/MacOS/$##' -e 's#/$##' -e 's/\\\(.\)/\1/g')
+bundle=$(plutil -extract CFBundleIdentifier raw -o - "$path/Contents/Info.plist" 2>/dev/null)
+[ -n "$bundle" ] && [ -f "$state/running/$bundle" ]

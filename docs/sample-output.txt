@@ -1,0 +1,145 @@
+weekly-update 0.1.0 sample output, captured from a real run in the test mode.
+
+Produced by the six README Quickstart commands after the clone and the cd,
+run as written from the repository folder, one after another. Captured once,
+outside the tests; no test regenerates it, so details can lag behind the code:
+
+  ./bin/weekly-update --version
+  ./bin/weekly-update check
+  ./bin/weekly-update auto --dry-run
+  ./install.sh --dry-run
+  ./install.sh
+  ~/.local/share/weekly-update/app/bin/weekly-update status
+
+This is the shimmed demo environment, not a real Mac. The commands ran in the
+test mode that tests/test-docs.sh uses: brew, softwareupdate, launchctl,
+osascript, defaults, pmset, open, sudo, caffeinate, sw_vers, id and pgrep were
+the test doubles in tests/shims, so nothing reached the real Homebrew,
+Software Update or launchd. The Dock listed the four example apps from
+tests/harness.sh on AC power, the home folder was fresh and empty apart from
+the repository copy, that Dock and an empty LaunchAgents folder, and there was
+no config file. The login name "tester" and the Homebrew version come from the
+test doubles. The doubles hold no Homebrew cask list and no installed casks,
+so no app is mapped to a cask ("no index", "No cask found"). The home folder
+is shown as ~; nothing else was changed. All six commands exited with status 0
+and wrote nothing to standard error.
+
+$ ./bin/weekly-update --version
+weekly-update 0.1.0
+
+$ ./bin/weekly-update check
+
+  WEEKLY UPDATE  .  check  .  report only, nothing changes
+  macOS . Dock apps . Homebrew . update-only
+    .  Config: defaults (~/.config/weekly-update/config)
+
+  1/3  Dock apps
+    .  Homebrew index date unknown
+    .  App                      Installed        Index        State        Group     Cask       Run  Writable Managed
+    .  Firefox                  130.0            -            no index     manual    -          no   yes      no
+    .  Zed                      0.150.0          -            no index     manual    -          no   yes      no
+    .  Visual Studio Code       1.93.0           -            no index     manual    -          no   yes      no
+    .  Safari                   18.0             -            system       system    -          no   yes      no
+    .  Groups. system: macOS updates it. vendor: its maker updates it in the background. silent: Homebrew may upgrade it unattended when it is closed. assisted: only an interactive pass upgrades it, for example one with an installer package, a background helper, a bundle or link folder this account cannot write, or a file in the way of a link. manual: update it from inside the app.
+    .  Cask. confirmed: named in your config. proposed: found automatically and report-only until you confirm it with setup.
+    .  No cask found for: Firefox, Zed, Visual Studio Code. To manage one, add an [app BUNDLE_ID] section with cask = TOKEN to ~/.config/weekly-update/config
+
+  2/3  macOS
+    +  macOS is current: no new software available
+
+  3/3  Schedule
+    .  Next unattended pass: Sunday 2026-10-04 14:00
+    !  The schedule is not loaded (local.tester.weekly-update). Run install.sh from the folder you downloaded to load it
+    .  No LaunchAgent file at ~/Library/LaunchAgents/local.tester.weekly-update.plist
+
+  Check finished; nothing was changed and nothing was written.
+
+
+$ ./bin/weekly-update auto --dry-run
+
+  WEEKLY UPDATE  .  auto  .  dry run, nothing changes
+  macOS . Dock apps . Homebrew . update-only
+
+  1/5  Preflight
+    +  Homebrew 4.4.0
+    +  On AC power
+    .  Dry run: no lock taken and nothing kept awake
+
+  2/5  Homebrew index
+    .  Dry run: the index is not refreshed
+    .  Homebrew index date unknown
+
+  3/5  Dock apps
+    .  App                      Installed        Index        State        Group     Cask       Run  Writable Managed
+    .  Firefox                  130.0            -            no index     manual    -          no   yes      no
+    .  Zed                      0.150.0          -            no index     manual    -          no   yes      no
+    .  Visual Studio Code       1.93.0           -            no index     manual    -          no   yes      no
+    .  Safari                   18.0             -            system       system    -          no   yes      no
+    .  Groups. system: macOS updates it. vendor: its maker updates it in the background. silent: Homebrew may upgrade it unattended when it is closed. assisted: only an interactive pass upgrades it, for example one with an installer package, a background helper, a bundle or link folder this account cannot write, or a file in the way of a link. manual: update it from inside the app.
+    .  Cask. confirmed: named in your config. proposed: found automatically and report-only until you confirm it with setup.
+    .  No cask found for: Firefox, Zed, Visual Studio Code. To manage one, add an [app BUNDLE_ID] section with cask = TOKEN to ~/.config/weekly-update/config
+    .  No app is confirmed yet, so none is checked for upgrades; confirm one with setup or with a cask line in the config
+
+  4/5  macOS
+    +  macOS is current: no new software available
+
+  5/5  Summary
+    +  Finished in 1s: 0 app(s) upgraded
+    .  A real slot would record completed and notify that nothing needs you
+
+  Dry run finished; nothing was changed and nothing was written.
+
+
+$ ./install.sh --dry-run
+
+  WEEKLY UPDATE  .  install
+  copies the tool, renders the LaunchAgent, loads the schedule
+    +  Source folder complete, lib/ matches its manifest
+    +  LaunchAgent rendered and linted: local.tester.weekly-update, 8 slot(s) a week, RunAtLoad false, Aqua sessions only
+    .  Tool copy:   ~/.local/share/weekly-update/app
+    .  LaunchAgent: ~/Library/LaunchAgents/local.tester.weekly-update.plist
+    .  Logs:        ~/Library/Logs/weekly-update
+    .  Config:      ~/.config/weekly-update/config (optional, never written by install)
+
+  Dry run: nothing was written and nothing was loaded.
+
+
+$ ./install.sh
+
+  WEEKLY UPDATE  .  install
+  copies the tool, renders the LaunchAgent, loads the schedule
+    +  Source folder complete, lib/ matches its manifest
+    +  LaunchAgent rendered and linted: local.tester.weekly-update, 8 slot(s) a week, RunAtLoad false, Aqua sessions only
+    .  Tool copy:   ~/.local/share/weekly-update/app
+    .  LaunchAgent: ~/Library/LaunchAgents/local.tester.weekly-update.plist
+    .  Logs:        ~/Library/Logs/weekly-update
+    .  Config:      ~/.config/weekly-update/config (optional, never written by install)
+    +  Installed the tool copy and the LaunchAgent
+    +  Schedule loaded: local.tester.weekly-update. Loading it never starts a pass; the first one runs at the next slot
+
+  Installed weekly-update 0.1.0.
+  Try it:     ~/.local/share/weekly-update/app/bin/weekly-update check
+  Status:     ~/.local/share/weekly-update/app/bin/weekly-update status
+  Tripwire:   ~/.local/share/weekly-update/app/bin/weekly-update verify
+  Remove it:  ~/.local/share/weekly-update/app/bin/weekly-update-uninstall
+
+
+$ ~/.local/share/weekly-update/app/bin/weekly-update status
+
+  WEEKLY UPDATE  .  status  .  report only, nothing changes
+  macOS . Dock apps . Homebrew . update-only
+    .  Config: defaults (~/.config/weekly-update/config)
+
+  1/3  History
+    .  No history yet
+
+  2/3  Schedule
+    .  Slots: weekday 0, 14:00 to 21:00, hourly
+    .  Next unattended pass: Sunday 2026-10-04 14:00
+    +  The schedule is loaded (local.tester.weekly-update)
+    +  The LaunchAgent on disk matches this config
+
+  3/3  Sizes
+    .  Log folder:   0B at ~/Library/Logs/weekly-update
+    .  Homebrew download cache:   0B. Nothing here removes it; cleaning it is up to you
+

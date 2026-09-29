@@ -1,0 +1,2394 @@
+#!/bin/bash
+# weekly-update: keeps macOS and the apps in the Dock current, once a week.
+# The contract is update-only: nothing here deletes an app, a file or a setting
+# itself, and README.md, What it never does, names what Homebrew itself can
+# remove. The unattended pass (auto) never quits a running app, never calls
+# sudo itself and never installs a macOS update. It upgrades only closed apps
+# you confirmed in the config, and opens a window when something needs a
+# person. In a window, every question defaults to No, a macOS install is asked
+# about before the administrator password, and a restart needs its own typed
+# yes.
+# shellcheck source-path=SCRIPTDIR
+set -u
+set -o pipefail
+set -o noclobber
+# Cask options are cleared, not set: a global --no-binaries makes every upgrade
+# drop the cask's command-line links. Only adopt_cask passes it.
+export HOMEBREW_NO_INSTALL_CLEANUP=1
+export HOMEBREW_NO_AUTOREMOVE=1
+export HOMEBREW_NO_INSTALL_UPGRADE=1
+export HOMEBREW_NO_ENV_HINTS=1
+export HOMEBREW_NO_AUTO_UPDATE=1
+unset HOMEBREW_CASK_OPTS
+case ${HOME:-} in
+  /*) ;;
+  *)
+    printf '%s: HOME must be an absolute path\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac
+# A trailing slash would put "//" into every path below, and status compares
+# the rendered LaunchAgent with the installed one byte for byte.
+while :; do
+  case $HOME in
+    ?*/) HOME=${HOME%/} ;;
+    *) break ;;
+  esac
+done
+export HOME
+
+if [ -x /opt/homebrew/bin/brew ]; then
+  BREW_BIN=/opt/homebrew/bin
+elif [ -x /usr/local/bin/brew ]; then
+  BREW_BIN=/usr/local/bin
+else
+  BREW_BIN=""
+fi
+# System directories first: the Homebrew bin is writable by the user, so a
+# same-named file there must never stand in for sudo or any other system tool.
+# The empty case adds nothing, because an empty PATH entry means the current
+# directory.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin${BREW_BIN:+:$BREW_BIN}"
+
+WU_VERSION=0.1.0
+SHIMMED_TOOLS="softwareupdate osascript defaults pmset launchctl open sudo caffeinate sw_vers id pgrep brew"
+SEAM_TTY=""
+SEAM_INTERACTIVE=""
+SEAM_APPLICATIONS=""
+SEAM_FAST=0
+
+# Nothing outside this function reads WU_TEST*, and the tripwire checks that.
+# Seams apply only inside a sandbox the test harness created, and only when
+# every tool the tests replace resolves to the replacement, so a half-seamed
+# run can never reach the real system.
+apply_test_seams() {
+  local tool found home_real root_real
+  [ -n "${WU_TEST:-}" ] || return 0
+  if [ "$WU_TEST" != 1 ]; then
+    printf 'weekly-update: WU_TEST must be 1 or unset\n' >&2
+    exit 2
+  fi
+  if [ -z "${WU_TEST_ROOT:-}" ] || [ ! -f "$WU_TEST_ROOT/.weekly-update-test-root" ]; then
+    printf 'weekly-update: test seams requested outside a sandbox\n' >&2
+    exit 2
+  fi
+  home_real=$(cd "$HOME" 2>/dev/null && pwd -P)
+  root_real=$(cd "$WU_TEST_ROOT" 2>/dev/null && pwd -P)
+  case $home_real/ in
+    "$root_real"/?*) ;;
+    *)
+      printf 'weekly-update: test seams requested outside a sandbox (HOME is not under the test root)\n' >&2
+      exit 2
+      ;;
+  esac
+  if [ -z "${WU_TEST_SHIMS:-}" ] || [ ! -d "$WU_TEST_SHIMS" ]; then
+    printf 'weekly-update: test seams need WU_TEST_SHIMS to name the shim directory\n' >&2
+    exit 2
+  fi
+  export PATH="$WU_TEST_SHIMS:/usr/bin:/bin:/usr/sbin:/sbin${WU_TEST_BREW_BIN:+:$WU_TEST_BREW_BIN}"
+  for tool in $SHIMMED_TOOLS; do
+    found=$(command -v "$tool" 2>/dev/null)
+    if [ "$found" != "$WU_TEST_SHIMS/$tool" ]; then
+      printf 'weekly-update: test seams refused: %s resolves to %s, not to the shim directory\n' "$tool" "${found:-nothing}" >&2
+      exit 2
+    fi
+  done
+  SEAM_TTY=${WU_TEST_TTY:-}
+  SEAM_INTERACTIVE=${WU_TEST_INTERACTIVE:-}
+  SEAM_APPLICATIONS=${WU_TEST_APPLICATIONS:-}
+  SEAM_FAST=${WU_TEST_FAST:-0}
+  return 0
+}
+
+apply_test_seams
+
+# `bash weekly-update` reads the file from the current folder before it
+# searches PATH, so a name without a slash is looked up in that order too.
+case $0 in
+  */*) SELF_PATH=$0 ;;
+  *) if [ -f "$0" ]; then SELF_PATH=./$0; else SELF_PATH=$(command -v "$0"); fi ;;
+esac
+# A link to the runtime, say in ~/bin, must still find lib/ beside the real file.
+link_hops=0
+while [ -L "$SELF_PATH" ] && [ "$link_hops" -lt 32 ]; do
+  link_target=$(readlink "$SELF_PATH") || break
+  case $link_target in
+    /*) SELF_PATH=$link_target ;;
+    *) SELF_PATH=${SELF_PATH%/*}/$link_target ;;
+  esac
+  link_hops=$((link_hops + 1))
+done
+SELF_DIR=$(CDPATH='' cd -P -- "${SELF_PATH%/*}" 2>/dev/null && pwd -P)
+if [ -z "$SELF_DIR" ]; then
+  printf 'weekly-update: cannot find its own directory from %s\n' "$0" >&2
+  exit 2
+fi
+APP_ROOT=${SELF_DIR%/*}
+LIB_DIR=$APP_ROOT/lib
+TEMPLATE=$APP_ROOT/templates/launchagent.plist.template
+SHIM=$SELF_DIR/weekly-update-scheduled
+VERIFY=$SELF_DIR/weekly-update-verify
+
+LOG_DIR=$HOME/Library/Logs/weekly-update
+HISTORY_FILE=$LOG_DIR/history.tsv
+LOCK_FILE=$LOG_DIR/run.lock
+NUDGE_LEDGER=$LOG_DIR/nudge-ledger.tsv
+APPS_LEDGER=$LOG_DIR/apps.tsv
+CONFIG_FILE=$HOME/.config/weekly-update/config
+DOCK_PLIST=$HOME/Library/Preferences/com.apple.dock.plist
+LAUNCH_AGENTS=$HOME/Library/LaunchAgents
+APPLICATIONS_DIR=${SEAM_APPLICATIONS:-/Applications}
+SOFTWARE_UPDATE_PANE="x-apple.systempreferences:com.apple.Software-Update-Settings.extension"
+
+# These are the cask artifact kinds allowed in the silent group and for
+# adoption. A failed adoption is rolled back, and that rollback removes the
+# app, so adopt_cask passes --no-binaries and a link cannot fail the adoption
+# itself. An upgrade links binary, command_wrapper and the completions again. A
+# file that is not a link at one of those paths fails it, Homebrew's revert
+# then fails on the same file, and undoing that revert removes the app. So
+# every such path is checked (link_in_the_way): an app with a file in the way
+# is neither adopted nor upgraded, in any mode. A link folder this account
+# cannot write makes Homebrew ask for sudo, so such an app is never silent
+# (link_folder_needs_admin).
+SILENT_SAFE_KEYS="app uninstall zap binary command_wrapper bash_completion zsh_completion fish_completion"
+ADOPT_SAFE_KEYS="app uninstall zap binary command_wrapper"
+SEP=$'\037'
+LINK_SEP=$'\036'
+
+unset _UTIL_SH_LOADED _TERM_SH_LOADED _REPORT_SH_LOADED _LIFECYCLE_SH_LOADED _PROMPT_SH_LOADED _CONF_SH_LOADED
+REPORT_RUN_LOG=""
+REPORT_HISTORY_FILE=""
+REPORT_MODE=run
+REPORT_VERSION=$WU_VERSION
+PROMPT_TTY=${SEAM_TTY:-/dev/tty}
+PROMPT_INTERACTIVE=$SEAM_INTERACTIVE
+LIFECYCLE_INTERRUPT_HINT="Nothing was deleted. Rerun whenever convenient."
+LIFECYCLE_ABORT_HOOK=notify_stopped
+LIFECYCLE_KILL_GRACE=5
+LIFECYCLE_POLL_INTERVAL=0.2
+[ "$SEAM_FAST" != 1 ] || LIFECYCLE_POLL_INTERVAL=0.05
+TERM_PHASE_LABEL=startup
+# shellcheck source=../lib/util.sh
+. "$LIB_DIR/util.sh" || exit 2
+# shellcheck source=../lib/report.sh
+. "$LIB_DIR/report.sh" || exit 2
+# shellcheck source=../lib/term.sh
+. "$LIB_DIR/term.sh" || exit 2
+# shellcheck source=../lib/lifecycle.sh
+. "$LIB_DIR/lifecycle.sh" || exit 2
+# shellcheck source=../lib/prompt.sh
+. "$LIB_DIR/prompt.sh" || exit 2
+# shellcheck source=../lib/conf.sh
+. "$LIB_DIR/conf.sh" || exit 2
+
+MODE_TABLE='run|Interactive pass: Dock apps, then macOS. Asks before anything that needs you; every question defaults to No.
+auto|One unattended slot, the one the schedule runs. Upgrades only confirmed apps that are closed; never quits an app, never calls sudo itself, never installs macOS updates.
+scheduled|The window a slot opens when something needs you. Asks first (default No, times out), then runs the interactive pass.
+setup|One-time interactive setup: confirm proposed casks into the config, adopt confirmed apps into Homebrew, show the macOS automatic-update settings.
+check|Report only: Dock inventory, the macOS listing and the agent state. Changes nothing and writes nothing.
+status|History, pending restarts, schedule, heartbeat and whether the installed agent matches the config. Writes nothing.
+verify|Run the static regression tripwire over these files. A tripwire, not a proof.
+plist|Print the LaunchAgent that this config renders to. Writes nothing.
+help|Print this text, or help MODE for one mode.'
+FLAG_TABLE='--dry-run|With run or auto: print what the pass would do. No lock, no index refresh, no history row, no notification, no change.
+--version|Print the version.
+--help|Print this text; -h is the same. --help MODE describes one mode.'
+
+print_help() {
+  local name summary
+  printf 'weekly-update %s: keeps macOS and the apps in your Dock current, once a week.\n\n' "$WU_VERSION"
+  printf 'Usage: weekly-update [MODE] [--dry-run]\n\n'
+  printf 'Modes (run is the default):\n'
+  while IFS='|' read -r name summary; do
+    printf '  %-10s %s\n' "$name" "$summary"
+  done <<EOF
+$MODE_TABLE
+EOF
+  printf '\nFlags:\n'
+  while IFS='|' read -r name summary; do
+    printf '  %-10s %s\n' "$name" "$summary"
+  done <<EOF
+$FLAG_TABLE
+EOF
+  printf '\nExit status: 0 done or stood down, 1 partial, stopped or issues found, 2 usage, invalid config or an unusable setup, 4 needs a terminal,\n'
+  printf '129, 130 or 143 a pass stopped by a hangup, an interrupt or a terminate signal.\n'
+  printf 'A dry run exits 0 even when its report lists failures; read its last lines.\n'
+  printf 'Config: ~/.config/weekly-update/config (optional; see config/weekly-update.conf.example)\n'
+  printf 'Logs:   ~/Library/Logs/weekly-update/\n'
+}
+
+print_mode_help() {
+  local wanted=$1 name summary found=0
+  while IFS='|' read -r name summary; do
+    if [ "$name" = "$wanted" ]; then
+      printf 'weekly-update %s\n  %s\n' "$name" "$summary"
+      found=1
+    fi
+  done <<EOF
+$MODE_TABLE
+EOF
+  if [ "$found" = 0 ]; then
+    printf 'weekly-update: no mode called "%s"; run %s --help\n' "$wanted" "$(self_command)" >&2
+    return 2
+  fi
+  case $wanted in
+    auto) printf '  Stands down once a pass finished on or after the last slot day. A deferred window is retried by a later slot the same day, when one is left.\n' ;;
+    run) printf '  Add --dry-run to see the decisions without making any change.\n' ;;
+    setup) printf '  Loading the schedule is the job of install.sh, not of setup.\n' ;;
+  esac
+  return 0
+}
+
+MODE=run
+DRY_RUN=0
+HELP_TOPIC=""
+MODE_SEEN=0
+
+usage_error() {
+  printf 'weekly-update: %s\n' "$1" >&2
+  printf 'Run %s --help for the modes and flags.\n' "$(self_command)" >&2
+  exit 2
+}
+
+parse_arguments() {
+  local argument
+  for argument in "$@"; do
+    case $argument in
+      --dry-run) DRY_RUN=1 ;;
+      --version) MODE=version; MODE_SEEN=1 ;;
+      -h|--help) MODE=help; MODE_SEEN=1 ;;
+      -*) usage_error "unknown flag $argument" ;;
+      *)
+        if [ "$MODE" = help ] && [ "$MODE_SEEN" = 1 ] && [ -z "$HELP_TOPIC" ]; then
+          HELP_TOPIC=$argument
+        elif [ "$MODE_SEEN" = 0 ]; then
+          case $argument in
+            run|auto|scheduled|setup|check|status|verify|plist|help) MODE=$argument; MODE_SEEN=1 ;;
+            *) usage_error "unknown mode $argument" ;;
+          esac
+        else
+          usage_error "unexpected argument $argument"
+        fi
+        ;;
+    esac
+  done
+  if [ "$DRY_RUN" = 1 ]; then
+    case $MODE in
+      run|auto) ;;
+      *) usage_error "--dry-run works with run and auto only" ;;
+    esac
+  fi
+}
+
+WEEKDAY=0
+FIRST_HOUR=14
+LAST_HOUR=21
+MINUTE=0
+BATTERY_FLOOR=20
+QUIT_WAIT=120
+ENTRY_WAIT=14400
+NUDGE_GIVE_UP=2
+INDEX_TIMEOUT=300
+QUERY_TIMEOUT=120
+LIST_TIMEOUT=300
+SLOW_WARN=1800
+FINAL_PROMPT_TIMEOUT=600
+HEARTBEAT_DAYS=8
+LABEL_PREFIX=""
+ADMIN_HINT="This account is not an administrator, and installing macOS updates needs one. macOS installs are skipped this run."
+CONFIG_STATE=defaults
+
+declare_config_schema() {
+  conf_schema_reset
+  conf_schema_kind updater optional -
+  conf_schema_kind app many '[A-Za-z0-9][A-Za-z0-9.-]*'
+  conf_schema_key updater label_prefix 'match:[A-Za-z0-9][A-Za-z0-9.-]{0,199}'
+  conf_schema_key updater weekday int:0:6
+  conf_schema_key updater first_hour int:0:23
+  conf_schema_key updater last_hour int:0:23
+  conf_schema_key updater minute int:0:59
+  conf_schema_key updater battery_floor int:20:100
+  conf_schema_key updater quit_wait int:10:600
+  conf_schema_key updater entry_wait int:60:86400
+  conf_schema_key updater nudge_give_up int:1:10
+  conf_schema_key updater index_timeout int:5:3600
+  conf_schema_key updater query_timeout int:5:3600
+  conf_schema_key updater list_timeout int:5:3600
+  conf_schema_key updater slow_warn int:60:86400
+  conf_schema_key updater final_prompt_timeout int:10:3600
+  conf_schema_key updater heartbeat_days int:2:60
+  conf_schema_key updater admin_hint 'match:.*[^[:space:]].*'
+  conf_schema_key app cask 'match:[a-z0-9][a-z0-9@._+-]*'
+  conf_schema_key app group enum:vendor,manual
+  conf_schema_key app also_matches 'list:[A-Za-z0-9][A-Za-z0-9.-]*'
+  conf_schema_key app open_as 'match:[A-Za-z0-9][A-Za-z0-9.-]*'
+  conf_schema_key app open_warning text
+  conf_schema_key app version_drop_leading int:0:3
+}
+
+updater_value() {
+  conf_get updater '' "$1" "$2"
+}
+
+load_config() {
+  local name
+  declare_config_schema
+  if [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]; then
+    CONFIG_STATE=defaults
+    return 0
+  fi
+  if ! conf_load "$CONFIG_FILE"; then
+    case $(LC_ALL=C od -An -tx1 -N 3 "$CONFIG_FILE" 2>/dev/null | tr -d ' \n') in
+      efbbbf*|fffe*|feff*|??00*|00*) printf 'weekly-update: %s starts with a byte-order mark or is UTF-16; save it as plain UTF-8 text\n' "$CONFIG_FILE" >&2 ;;
+    esac
+    CONFIG_STATE=invalid
+    return 1
+  fi
+  WEEKDAY=$(updater_value weekday 0)
+  FIRST_HOUR=$(updater_value first_hour 14)
+  LAST_HOUR=$(updater_value last_hour 21)
+  MINUTE=$(updater_value minute 0)
+  if [ "$LAST_HOUR" -le "$FIRST_HOUR" ]; then
+    conf_error "$(conf_line updater '' last_hour || conf_line updater '' first_hour || conf_line updater '')" \
+      "last_hour must be later than first_hour, so there are at least two slots a day"
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if ! conf_has app "$name" cask && ! conf_has app "$name" group; then
+      conf_error "$(conf_line app "$name")" "[app $name] needs cask = TOKEN or group = vendor or manual"
+    fi
+  done <<EOF
+$(conf_names app)
+EOF
+  if [ "$CONF_ERROR_COUNT" -ne 0 ]; then
+    CONFIG_STATE=invalid
+    return 1
+  fi
+  BATTERY_FLOOR=$(updater_value battery_floor 20)
+  QUIT_WAIT=$(updater_value quit_wait 120)
+  ENTRY_WAIT=$(updater_value entry_wait 14400)
+  NUDGE_GIVE_UP=$(updater_value nudge_give_up 2)
+  INDEX_TIMEOUT=$(updater_value index_timeout 300)
+  QUERY_TIMEOUT=$(updater_value query_timeout 120)
+  LIST_TIMEOUT=$(updater_value list_timeout 300)
+  SLOW_WARN=$(updater_value slow_warn 1800)
+  FINAL_PROMPT_TIMEOUT=$(updater_value final_prompt_timeout 600)
+  HEARTBEAT_DAYS=$(updater_value heartbeat_days 8)
+  LABEL_PREFIX=$(updater_value label_prefix "")
+  ADMIN_HINT=$(updater_value admin_hint "$ADMIN_HINT")
+  CONFIG_STATE=loaded
+  return 0
+}
+
+config_invalid_exit() {
+  local first=${CONF_ERRORS%%$'\n'*}
+  printf 'weekly-update: the config file is invalid, so nothing runs: %s\n' "$first" >&2
+  case $MODE in
+    run|auto|scheduled|setup)
+      if [ "$DRY_RUN" != 1 ] && mkdir -p "$LOG_DIR" 2>/dev/null; then
+        REPORT_HISTORY_FILE=$HISTORY_FILE
+        REPORT_MODE=$MODE
+        if [ "$MODE" = auto ]; then
+          notify "Stopped: the config file is invalid ($first)"
+        fi
+        report_verdict stopped 2 "config invalid at $first"
+      fi
+      ;;
+  esac
+  exit 2
+}
+
+list_add() {
+  local current=${!1}
+  printf -v "$1" '%s' "${current:+$current, }$2"
+}
+
+bundle_id_ok() {
+  case $1 in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]*) return 1 ;;
+  esac
+  return 0
+}
+
+ere_escape() {
+  printf '%s' "$1" | LC_ALL=C sed 's/[]*^$+?(){}|.[\]/\\&/g'
+}
+
+login_name() {
+  local name
+  name=$(id -un 2>/dev/null)
+  name=$(printf '%s' "$name" | LC_ALL=C tr -c 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-' '-')
+  printf '%s' "${name:-user}"
+}
+
+agent_label() {
+  printf '%s.weekly-update' "${LABEL_PREFIX:-local.$(login_name)}"
+}
+
+render_calendar() {
+  local hour=$FIRST_HOUR
+  while [ "$hour" -le "$LAST_HOUR" ]; do
+    printf '\t\t<dict>\n\t\t\t<key>Weekday</key>\n\t\t\t<integer>%s</integer>\n' "$WEEKDAY"
+    printf '\t\t\t<key>Hour</key>\n\t\t\t<integer>%s</integer>\n' "$hour"
+    printf '\t\t\t<key>Minute</key>\n\t\t\t<integer>%s</integer>\n\t\t</dict>\n' "$MINUTE"
+    hour=$((hour + 1))
+  done
+}
+
+# RunAtLoad, LimitLoadToSessionType and the absence of KeepAlive are literals
+# in the template, never config, so no config can make loading start a pass.
+render_plist() {
+  local line label
+  if [ ! -r "$TEMPLATE" ]; then
+    printf 'weekly-update: cannot read the LaunchAgent template %s\n' "$TEMPLATE" >&2
+    return 2
+  fi
+  if [ "$(printf '%s' "$HOME" | tr -d '\046\074\076\042\047')" != "$HOME" ]; then
+    printf 'weekly-update: the home folder path has a character that XML would need escaped; not supported\n' >&2
+    return 2
+  fi
+  label=$(agent_label)
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      *__CALENDAR__*) render_calendar ;;
+      *)
+        line=${line//__HOME__/$HOME}
+        line=${line//__LABEL__/$label}
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done < "$TEMPLATE"
+}
+
+slot_epoch() {
+  date -v+"$1"d -v"$2"H -v"$3"M -v0S '+%s'
+}
+
+# launchd runs the slots of the LaunchAgent on disk, which differ from the
+# config until install.sh runs again, so the slot times come from that file
+# when this config's label has one.
+slot_list() {
+  local plist count i weekday hour minute
+  plist=$LAUNCH_AGENTS/$(agent_label).plist
+  count=$(plutil -extract StartCalendarInterval raw -o - "$plist" 2>/dev/null)
+  if util_is_uint "$count" && [ "$count" -gt 0 ]; then
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      weekday=$(plutil -extract "StartCalendarInterval.$i.Weekday" raw -o - "$plist" 2>/dev/null)
+      hour=$(plutil -extract "StartCalendarInterval.$i.Hour" raw -o - "$plist" 2>/dev/null)
+      minute=$(plutil -extract "StartCalendarInterval.$i.Minute" raw -o - "$plist" 2>/dev/null)
+      if util_is_uint "$weekday" && util_is_uint "$hour" && util_is_uint "$minute"; then
+        printf '%s %s %s\n' "$weekday" "$hour" "$minute"
+      fi
+      i=$((i + 1))
+    done
+    return 0
+  fi
+  hour=$FIRST_HOUR
+  while [ "$hour" -le "$LAST_HOUR" ]; do
+    printf '%s %s %s\n' "$WEEKDAY" "$hour" "$MINUTE"
+    hour=$((hour + 1))
+  done
+}
+
+next_fire_time() {
+  local slots now day weekday slot_weekday hour minute stamp earliest
+  slots=$(slot_list)
+  now=$(date '+%s')
+  day=0
+  # Once a pass has finished on or after the slot day, today's later slots stand down.
+  if pass_finished_since_slot_day; then day=1; fi
+  while [ "$day" -le 7 ]; do
+    weekday=$(date -v+"$day"d '+%w')
+    earliest=""
+    while read -r slot_weekday hour minute; do
+      [ "$slot_weekday" = "$weekday" ] || continue
+      stamp=$(slot_epoch "$day" "$hour" "$minute") || continue
+      if [ "$stamp" -gt "$now" ] && { [ -z "$earliest" ] || [ "$stamp" -lt "$earliest" ]; }; then
+        earliest=$stamp
+      fi
+    done <<EOF
+$slots
+EOF
+    if [ -n "$earliest" ]; then
+      LC_ALL=C date -r "$earliest" '+%A %Y-%m-%d %H:%M'
+      return 0
+    fi
+    day=$((day + 1))
+  done
+  printf 'unknown'
+}
+
+slot_left_today() {
+  local today now slot_weekday hour minute stamp
+  today=$(date '+%w')
+  now=$(date '+%s')
+  while read -r slot_weekday hour minute; do
+    [ "$slot_weekday" = "$today" ] || continue
+    stamp=$(slot_epoch 0 "$hour" "$minute") || continue
+    if [ "$stamp" -gt "$now" ]; then
+      return 0
+    fi
+  done <<EOF
+$(slot_list)
+EOF
+  return 1
+}
+
+# launchd runs the slots the Mac slept through at its next wake, on any day, so
+# the unattended slots belong to the most recent day that has a slot, today
+# included, not to the calendar day.
+slot_day() {
+  local slots back weekday
+  slots=$(slot_list)
+  back=0
+  while [ "$back" -le 6 ]; do
+    weekday=$(date -v-"$back"d '+%w')
+    if printf '%s\n' "$slots" | LC_ALL=C awk -v weekday="$weekday" '$1 == weekday { found = 1 } END { exit !found }'; then
+      date -v-"$back"d '+%Y-%m-%d'
+      return 0
+    fi
+    back=$((back + 1))
+  done
+  date '+%Y-%m-%d'
+}
+
+# Terminal outcomes end the slot day for the unattended slots; the deferrals and
+# stand-downs do not, so a later slot retries them.
+TERMINAL_OUTCOMES="completed partial escalated declined started"
+
+pass_finished_since_slot_day() {
+  [ -f "$HISTORY_FILE" ] || return 1
+  LC_ALL=C awk -F'\t' -v day="$(slot_day)" -v terminal=" $TERMINAL_OUTCOMES " '
+    day <= substr($1, 1, 10) && ($2 == "run" || $2 == "auto" || $2 == "scheduled") && index(terminal, " " $3 " ") { found = 1 }
+    END { exit !found }' "$HISTORY_FILE"
+}
+
+last_pass_row_today() {
+  [ -f "$HISTORY_FILE" ] || return 1
+  LC_ALL=C awk -F'\t' -v day="$(date '+%Y-%m-%d')" '
+    index($1, day) == 1 && ($2 == "auto" || $2 == "scheduled" || $2 == "run") && $3 != "slot skipped" && $3 != "skipped" && $3 != "restart-requested" { last = $3 "\t" $4 }
+    END { if (last == "") exit 1; print last }' "$HISTORY_FILE"
+}
+
+last_terminal_stamp() {
+  [ -f "$HISTORY_FILE" ] || return 1
+  LC_ALL=C awk -F'\t' -v terminal=" $TERMINAL_OUTCOMES " '
+    ($2 == "run" || $2 == "auto" || $2 == "scheduled") && index(terminal, " " $3 " ") { last = $1 }
+    END { if (last == "") exit 1; print last }' "$HISTORY_FILE"
+}
+
+# Messages name the runtime by the path it runs from: install puts nothing on
+# PATH, so a bare "weekly-update" in a notification would not be found.
+self_command() {
+  local path=$SELF_DIR/weekly-update rest escaped="'\\''"
+  rest=$path
+  case $path in
+    "$HOME"/*) rest=${path#"$HOME"/} ;;
+  esac
+  case $rest in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-]*) printf "'%s'" "${path//\'/$escaped}" ;;
+    "$path") printf '%s' "$path" ;;
+    *) printf '%s/%s' '~' "$rest" ;;
+  esac
+}
+
+heartbeat_check() {
+  local stamp finished_at now days
+  stamp=$(last_terminal_stamp) || return 0
+  finished_at=$(date -j -f '%Y-%m-%d %H:%M:%S' "$stamp" '+%s' 2>/dev/null) || return 0
+  now=$(date '+%s')
+  days=$(( (now - finished_at) / 86400 ))
+  if [ "$days" -ge "$HEARTBEAT_DAYS" ]; then
+    report_warning "No pass has finished for $days days (the last one finished $stamp). Check that the schedule is loaded: $(self_command) status"
+    # A log line alone is never read when every slot defers, so a slot also says
+    # it where the person sees it while no pass row is recorded today.
+    if [ "$MODE" = auto ] && ! last_pass_row_today >/dev/null; then
+      notify "No weekly pass has finished for $days days. See why with: $(self_command) status"
+    fi
+  fi
+  return 0
+}
+
+notify() {
+  local message
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would notify: $1"
+    return 0
+  fi
+  message=$(printf '%s' "$1" | tr -d '"\134')
+  osascript -e "display notification \"$message\" with title \"weekly-update\"" >/dev/null 2>&1
+  report_log NOTIFY "$message"
+  return 0
+}
+
+# shellcheck disable=SC2329 # called by name through LIFECYCLE_ABORT_HOOK
+notify_stopped() {
+  if [ "$MODE" = auto ]; then
+    notify "Stopped: $1"
+  fi
+  return 0
+}
+
+missing_tools() {
+  local tool missing=""
+  for tool in "$@"; do
+    command -v "$tool" >/dev/null 2>&1 || missing="${missing:+$missing }$tool"
+  done
+  printf '%s' "$missing"
+}
+
+MACOS_STEP_ALLOWED=1
+APP_STEP_ALLOWED=1
+BATTERY_DEFERRED=0
+
+check_admin() {
+  if id -Gn 2>/dev/null | grep -w admin >/dev/null; then
+    report_success "Administrator rights present"
+    return 0
+  fi
+  report_warning "$ADMIN_HINT"
+  MACOS_STEP_ALLOWED=0
+  return 0
+}
+
+check_battery() {
+  local battery percent
+  battery=$(pmset -g batt 2>/dev/null)
+  case $battery in
+    *"AC Power"*)
+      report_success "On AC power"
+      return 0
+      ;;
+  esac
+  percent=$(printf '%s\n' "$battery" | grep -o '[0-9][0-9]*%' | head -n 1 | tr -d '%')
+  if [ -z "$percent" ]; then
+    report_detail "Power source not reported; carrying on"
+    return 0
+  fi
+  if [ "$percent" -lt "$BATTERY_FLOOR" ]; then
+    report_warning "On battery at $percent percent. Below $BATTERY_FLOOR percent nothing is replaced, because a power loss in the middle of replacing an app is the one failure with no way back. Plug in and rerun"
+    BATTERY_DEFERRED=1
+    APP_STEP_ALLOWED=0
+    MACOS_STEP_ALLOWED=0
+    return 0
+  fi
+  report_detail "On battery at $percent percent"
+  case $MODE in
+    run|scheduled)
+      if [ "$DRY_RUN" != 1 ] && prompt_is_interactive && ! prompt_consent "Run the macOS install step on battery?" no; then
+        MACOS_STEP_ALLOWED=0
+      fi
+      ;;
+  esac
+  return 0
+}
+
+take_lock_or_stand_down() {
+  local status outcome=skipped
+  [ "$MODE" = auto ] && outcome="slot skipped"
+  if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+    lifecycle_abort "cannot create the log folder $LOG_DIR"
+  fi
+  lifecycle_take_lock "$LOCK_FILE"
+  status=$?
+  [ "$status" -eq 75 ] || return 0
+  report_warning "Another run holds the lock; nothing was touched"
+  report_verdict "$outcome" 0 "another run holds the lock"
+}
+
+# Every mode that changes things (run, scheduled, setup and auto) runs this one
+# preflight, so the battery floor, the run lock and keep-awake are decided in
+# one place.
+preflight() {
+  local missing
+  missing=$(missing_tools jq plutil osascript pmset pgrep sw_vers)
+  if ! command -v lockf >/dev/null 2>&1 && ! command -v flock >/dev/null 2>&1; then
+    missing="${missing:+$missing }lockf"
+  fi
+  if [ -n "$missing" ]; then
+    lifecycle_abort "missing tools: $missing"
+  fi
+  if ! command -v brew >/dev/null 2>&1; then
+    lifecycle_abort "Homebrew was not found in either standard prefix; get it from brew.sh and rerun"
+  fi
+  report_success "Homebrew $(brew --version 2>/dev/null | head -n 1 | cut -d ' ' -f 2)"
+  [ "$MODE" = auto ] || check_admin
+  check_battery
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Dry run: no lock taken and nothing kept awake"
+    return 0
+  fi
+  if [ "$MODE" = auto ] && [ "$BATTERY_DEFERRED" = 1 ]; then
+    return 0
+  fi
+  # A slot learns that today's pass finished only from this file, so a file it
+  # cannot append to would make every later slot open another window.
+  if { [ -e "$HISTORY_FILE" ] || [ -L "$HISTORY_FILE" ]; } && { [ ! -f "$HISTORY_FILE" ] || [ ! -w "$HISTORY_FILE" ]; }; then
+    lifecycle_abort "cannot write $HISTORY_FILE, so later slots could not tell that a pass finished. Make it a regular file this account can write, then rerun"
+  fi
+  take_lock_or_stand_down
+  # An existing run.lock opens in a log folder this account cannot write, and
+  # then the first row would be lost the same way.
+  if [ ! -e "$HISTORY_FILE" ] && [ ! -L "$HISTORY_FILE" ] && [ ! -w "$LOG_DIR" ]; then
+    lifecycle_abort "cannot write $HISTORY_FILE, so later slots could not tell that a pass finished. Make its folder writable by this account, then rerun"
+  fi
+  if ! lifecycle_keep_awake; then
+    report_detail "caffeinate was not found, so the Mac may sleep during the pass"
+  fi
+  return 0
+}
+
+APP_COUNT=0
+app_name=(); app_path=(); app_tile=(); app_open=(); app_version=(); app_token=()
+app_source=(); app_confirmed=(); app_group=(); app_index=(); app_state=(); app_running=()
+app_writable=(); app_managed=(); app_adoptable=(); app_extra=(); app_helpers=(); app_in_apps=()
+app_warning=(); app_links=()
+INSTALLED_MAP=""
+CASK_NAMES_FILE=""
+CASKROOM=""
+BREW_PREFIX_DIR=""
+
+# A signal to the pass's process group ends the subshell of a command
+# substitution, and the deadline with it, while the command runs on in its own
+# group and the pass waits for its output. So the subshell stops that group.
+capture_with_deadline() {
+  trap '[ -z "$LIFECYCLE_DEADLINE_PGID" ] || _lifecycle_stop_group "$LIFECYCLE_DEADLINE_PGID"; exit 143' INT TERM HUP
+  lifecycle_run_with_deadline "$@"
+}
+
+load_installed_casks() {
+  local json status
+  INSTALLED_MAP=""
+  json=$(capture_with_deadline "$QUERY_TIMEOUT" brew info --cask --installed --json=v2 2>>"$RUN_SINK")
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    report_failure "Homebrew could not list the casks it manages (status $status); automatic mapping is off this run" "query(installed)"
+    return 1
+  fi
+  if ! INSTALLED_MAP=$(printf '%s' "$json" | jq -r '.casks | if type == "array" then .[] | .token as $t | (.artifacts // [])[] | select(type == "object" and has("app")) | .app[] | select(type == "string") | . + "\u001f" + $t else error("unexpected shape") end' 2>>"$RUN_SINK"); then
+    INSTALLED_MAP=""
+    report_failure "The list of managed casks did not have the expected shape; automatic mapping is off this run" "query(installed)"
+    return 1
+  fi
+  return 0
+}
+
+installed_token_for() {
+  local bundle_name=$1 line
+  while IFS= read -r line; do
+    if [ "${line%%"$SEP"*}" = "$bundle_name" ]; then
+      printf '%s' "${line#*"$SEP"}"
+      return 0
+    fi
+  done <<EOF
+$INSTALLED_MAP
+EOF
+  return 1
+}
+
+guess_token_for() {
+  local bundle_name=$1 guess
+  [ -n "$CASK_NAMES_FILE" ] && [ -r "$CASK_NAMES_FILE" ] || return 1
+  guess=$(util_to_lower "${bundle_name%.app}")
+  guess=${guess// /-}
+  LC_ALL=C grep -Fxq -- "$guess" "$CASK_NAMES_FILE" || return 1
+  printf '%s' "$guess"
+}
+
+config_app_for_tile() {
+  local tile=$1 name
+  if conf_has app "$tile" cask || conf_has app "$tile" group; then
+    printf '%s' "$tile"
+    return 0
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if util_contains_word "$tile" "$(conf_get app "$name" also_matches "")"; then
+      printf '%s' "$name"
+      return 0
+    fi
+  done <<EOF
+$(conf_names app)
+EOF
+  return 1
+}
+
+# link_paths yields every path where an upgrade of the cask links a command
+# (binary, command_wrapper), a completion or a man page, joined by LINK_SEP. It
+# follows Homebrew's own rules: a resolved target field when the answer has
+# one; else the target: option or the source's name, under the prefix's bin,
+# completion or man folder, with the completion renames and the man section
+# taken from the file name; the API's /$HOME, $HOMEBREW_PREFIX and $APPDIR
+# placeholders replaced. A path it cannot place is printed as ?TEXT, and
+# link_in_the_way treats that as in the way.
+# shellcheck disable=SC2016 # jq variables and Homebrew's literal placeholders, never shell expansions
+CASK_LINKS_JQ='def unph: split("/$HOME") | join($home) | split("$HOMEBREW_PREFIX") | join($prefix) | split("$APPDIR") | join($appdir);
+  def base: rtrimstr("/") | sub(".*/"; "");
+  def stem: if test("^.+[.][^.]*$") then sub("[.][^.]*$"; "") else . end;
+  def named: ((.[1]? | objects | .target? | strings) // "") as $t | if $t != "" then ($t | unph) else ((.[0]? | strings) // "" | unph | base) end;
+  def under($dir): if . == "" then "?" elif startswith("/") then . elif . == "~" or startswith("~/") then $home + .[1:] elif $prefix == "" then "?" + . else $prefix + "/" + $dir + "/" + . end;
+  def link_paths: [ (.artifacts // [])[] | objects
+    | if (.target | type) == "string" and (has("binary") or has("command_wrapper") or has("bash_completion") or has("zsh_completion") or has("fish_completion") or has("pwsh_completion") or has("manpage")) then (.target | unph)
+      elif has("binary") then (.binary | named | under("bin"))
+      elif has("command_wrapper") then ((.command_wrapper[0]? | strings) // "" | unph | under("bin"))
+      elif has("bash_completion") then (.bash_completion | named | base | stem | under("etc/bash_completion.d"))
+      elif has("zsh_completion") then (.zsh_completion | named | (if startswith("_") then . else "_" + (base | stem) end) | under("share/zsh/site-functions"))
+      elif has("fish_completion") then (.fish_completion | named | (if endswith(".fish") then . else (base | stem) + ".fish" end) | under("share/fish/vendor_completions.d"))
+      elif has("pwsh_completion") then (.pwsh_completion | named | (if startswith("_") and endswith(".ps1") then . else "_" + (base | stem) + ".ps1" end) | under("share/pwsh/completions"))
+      elif has("manpage") then (((.manpage[0]? | strings) // "" | unph) as $m | (($m | capture("[.](?<s>[1-8nl])([.]gz)?$") | .s) // "") as $s | if $s == "" then "?" + $m else ($m | base | under("share/man/man" + $s)) end)
+      else empty end
+    | if startswith("?") or test("[$]") then "?" + ltrimstr("?") else . end ] | join("\u001e");
+'
+
+# The query prints version, app artifact, pkg count, uninstall keys, installed
+# version, artifact keys, background-helper count and link paths, joined by
+# the unit separator, after checking the answer has exactly one cask. Recent
+# Homebrew versions add a resolved target field beside each moved or linked
+# artifact; it is a path, not an artifact kind, so the allowlists never see it.
+CASK_QUERY_JQ='.casks | if type == "array" and length == 1 then .[0] | [ (.version // "" | tostring), ([(.artifacts // [])[] | select(type == "object" and has("app")) | .app[0] | select(type == "string")] | first // ""), ([(.artifacts // [])[] | select(type == "object" and has("pkg"))] | length | tostring), ([(.artifacts // [])[] | select(type == "object" and has("uninstall")) | .uninstall[]? | select(type == "object") | keys[]] | unique | join(",")), (.installed // "" | tostring), ([(.artifacts // [])[] | select(type == "object") | keys[] | select(. != "target")] | unique | join(" ")), ([(.artifacts // [])[] | select(type == "object" and has("uninstall")) | .uninstall[]? | select(type == "object") | .launchctl // empty] | flatten | length | tostring), link_paths ] | join("\u001f") else error("unexpected shape") end'
+
+query_cask() {
+  local token=$1 json status
+  CASK_ROW=""
+  json=$(capture_with_deadline "$QUERY_TIMEOUT" brew info --cask "$token" --json=v2 2>>"$RUN_SINK")
+  status=$?
+  [ "$status" -eq 0 ] || return 1
+  CASK_ROW=$(printf '%s' "$json" | jq -r --arg home "$HOME" --arg prefix "$BREW_PREFIX_DIR" --arg appdir "$APPLICATIONS_DIR" "$CASK_LINKS_JQ$CASK_QUERY_JQ" 2>>"$RUN_SINK") || return 1
+  [ -n "$CASK_ROW" ]
+}
+
+compare_versions() {
+  local installed=$1 index=$2 drop=${3:-0} left_count right_count i left right
+  local -a left_parts right_parts
+  case $installed in
+    ''|unknown|missing) printf 'unordered'; return 0 ;;
+  esac
+  case "$installed:$index" in
+    :*|*:|*[!0123456789.:]*|*..*|.*|*.:*|*:.*|*.) printf 'unordered'; return 0 ;;
+  esac
+  IFS=. read -r -a left_parts <<EOF
+$installed
+EOF
+  IFS=. read -r -a right_parts <<EOF
+$index
+EOF
+  left_count=${#left_parts[@]}
+  right_count=${#right_parts[@]}
+  if [ "$drop" -gt 0 ]; then
+    if [ "$left_count" -ne $((right_count + drop)) ]; then
+      printf 'unordered'
+      return 0
+    fi
+    left_parts=("${left_parts[@]:$drop}")
+    left_count=${#left_parts[@]}
+  fi
+  i=0
+  while [ "$i" -lt "$left_count" ] || [ "$i" -lt "$right_count" ]; do
+    left=${left_parts[$i]:-0}
+    right=${right_parts[$i]:-0}
+    if [ "${#left}" -gt 15 ] || [ "${#right}" -gt 15 ]; then
+      printf 'unordered'
+      return 0
+    fi
+    left=$((10#$left))
+    right=$((10#$right))
+    if [ "$left" -lt "$right" ]; then printf 'older'; return 0; fi
+    if [ "$left" -gt "$right" ]; then printf 'newer'; return 0; fi
+    i=$((i + 1))
+  done
+  printf 'same'
+}
+
+apps_ledger_add() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  [ "$LEDGERS_WRITABLE" = 1 ] || return 0
+  printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "$3" >> "$APPS_LEDGER" 2>/dev/null
+  return 0
+}
+
+# A run writes its seen row before it changes the app, so a change in the same
+# second as the last sighting still counts as after it.
+missing_app_warning() {
+  local name=$1 seen touched
+  [ -f "$APPS_LEDGER" ] || return 0
+  seen=$(LC_ALL=C awk -F'\t' -v n="$name" '$2 == "seen" && ($3 "") == (n "") { last = $1 } END { print last }' "$APPS_LEDGER")
+  [ -n "$seen" ] || return 0
+  touched=$(LC_ALL=C awk -F'\t' -v n="$name" -v since="$seen" '($2 == "upgraded" || $2 == "adopted" || $2 == "upgrade-failed") && ($3 "") == (n "") && !($1 < since) { last = $1 " (" $2 ")" } END { print last }' "$APPS_LEDGER")
+  if [ -n "$touched" ]; then
+    report_warning "$name is missing from disk; a run last saw it at $seen, and this tool last changed it at $touched"
+  else
+    report_warning "$name is missing from disk since the run of $seen; this tool has not touched it since"
+  fi
+}
+
+load_dock_inventory() {
+  local count i tile_type url tile path name version key token source confirmed group
+  local index_version cask_app pkg_count uninstall_keys installed_meta artifact_keys helper_count
+  local index_short state running writable managed adopt_safe silent_safe extra artifact in_apps drop
+  local link_paths link_block link_folder
+  APP_COUNT=0
+  CASKROOM=$(brew --caskroom 2>/dev/null)
+  BREW_PREFIX_DIR=$(brew --prefix 2>/dev/null)
+  CASK_NAMES_FILE="$(brew --cache 2>/dev/null)/api/cask_names.txt"
+  load_installed_casks
+  count=$(plutil -extract persistent-apps raw -o - "$DOCK_PLIST" 2>/dev/null)
+  if ! util_is_uint "$count"; then
+    report_failure "The Dock preferences at $DOCK_PLIST are missing or could not be read, so no app was checked" "query(dock)"
+    return 0
+  fi
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    tile_type=$(plutil -extract "persistent-apps.$i.tile-type" raw -o - "$DOCK_PLIST" 2>/dev/null)
+    url=$(plutil -extract "persistent-apps.$i.tile-data.file-data._CFURLString" raw -o - "$DOCK_PLIST" 2>/dev/null)
+    tile=$(plutil -extract "persistent-apps.$i.tile-data.bundle-identifier" raw -o - "$DOCK_PLIST" 2>/dev/null)
+    i=$((i + 1))
+    [ "$tile_type" = file-tile ] || continue
+    path=${url#file://}
+    path=$(printf '%b' "${path//\%/\\x}")
+    path=${path%/}
+    case $path in
+      *.app/Contents/*) path="${path%%.app/Contents/*}.app" ;;
+    esac
+    name=${path##*/}
+    name=${name%.app}
+    if [ -d "$path" ]; then
+      version=$(plutil -extract CFBundleShortVersionString raw -o - "$path/Contents/Info.plist" 2>/dev/null)
+      version=${version:-unknown}
+    else
+      version=missing
+    fi
+    running=no
+    writable=no
+    in_apps=no
+    token=""; source=none; confirmed=no; group=""; index_short="-"; state="no index"
+    managed=no; adopt_safe=no; silent_safe=no; extra=""; helper_count=0; drop=0
+    link_paths=""; link_block=""
+    key=$tile
+    if ! bundle_id_ok "$tile"; then
+      group=manual
+      state="bad id"
+    else
+      if app_is_running "$path"; then running=yes; fi
+      if [ -w "$path" ] && [ -w "${path%/*}" ]; then writable=yes; fi
+      case $path in
+        "$APPLICATIONS_DIR"/*/*) ;;
+        "$APPLICATIONS_DIR"/*.app) in_apps=yes ;;
+      esac
+      key=$(config_app_for_tile "$tile") || key=$tile
+      case $tile in
+        com.apple.*) group=system; state=system ;;
+      esac
+      if [ -z "$group" ] && conf_has app "$key" group; then
+        group=$(conf_get app "$key" group)
+      fi
+      if conf_has app "$key" cask; then
+        token=$(conf_get app "$key" cask); source=config; confirmed=yes
+      elif [ -z "$group" ]; then
+        if token=$(installed_token_for "${path##*/}"); then
+          source=installed
+        elif token=$(guess_token_for "${path##*/}"); then
+          source=guess
+        else
+          token=""
+        fi
+      fi
+      drop=$(conf_get app "$key" version_drop_leading 0)
+    fi
+    if [ -n "$token" ] && [ "$group" != system ]; then
+      if ! query_cask "$token"; then
+        report_failure "Could not read the Homebrew entry for $name ($token); it is left alone this run" "query($token)"
+        state="query failed"
+        [ -n "$group" ] || group=manual
+      else
+        IFS=$SEP read -r index_version cask_app pkg_count uninstall_keys installed_meta artifact_keys helper_count link_paths <<EOF
+$CASK_ROW
+EOF
+        index_short=${index_version%%[,-]*}
+        index_short=${index_short:--}
+        [ -n "$installed_meta" ] && managed=yes
+        util_is_uint "$helper_count" || helper_count=0
+        if [ -n "$artifact_keys" ]; then
+          adopt_safe=yes
+          silent_safe=yes
+          for artifact in $artifact_keys; do
+            if ! util_contains_word "$artifact" "$ADOPT_SAFE_KEYS"; then
+              adopt_safe=no
+              extra="${extra:+$extra }$artifact"
+            fi
+            util_contains_word "$artifact" "$SILENT_SAFE_KEYS" || silent_safe=no
+          done
+        else
+          extra="cask metadata unavailable"
+        fi
+        if link_block=$(link_in_the_way "$link_paths"); then
+          adopt_safe=no
+          silent_safe=no
+        fi
+        if [ -z "$group" ]; then
+          if [ "$cask_app" != "${path##*/}" ]; then
+            group=manual
+            if [ "$source" = guess ]; then token=""; source=none; fi
+          elif [ "${pkg_count:-0}" != 0 ] || [ "$silent_safe" = no ]; then
+            group=assisted
+          else
+            case ",$uninstall_keys," in
+              ,,|,quit,|,signal,|,quit,signal,) group=silent ;;
+              *) group=assisted ;;
+            esac
+          fi
+          if [ "$group" = silent ] && [ "$writable" = no ]; then group=assisted; fi
+          if [ "$group" = silent ] && link_folder=$(link_folder_needs_admin "$link_paths"); then
+            group=assisted
+            report_detail "$name: Homebrew would need the administrator password to link into $link_folder, which this account cannot write, so $name waits for a person"
+          fi
+        fi
+        if [ "$index_short" != "-" ] && [ -n "$token" ]; then
+          state=$(compare_versions "$(printf '%s' "$version" | sed 's/ (\([0-9][0-9]*\))$/.\1/')" "$index_short" "$drop")
+        fi
+      fi
+    fi
+    [ -n "$group" ] || group=manual
+    [ -z "$link_block" ] || report_warning "$(link_block_text "$name" "$link_block")"
+    if [ "$version" = missing ]; then
+      missing_app_warning "$name"
+    else
+      apps_ledger_add seen "$name" "$version"
+    fi
+    app_name[APP_COUNT]=$name; app_path[APP_COUNT]=$path; app_tile[APP_COUNT]=$tile
+    app_open[APP_COUNT]=$(conf_get app "$key" open_as "$tile")
+    app_version[APP_COUNT]=$version; app_token[APP_COUNT]=$token; app_source[APP_COUNT]=$source
+    app_confirmed[APP_COUNT]=$confirmed; app_group[APP_COUNT]=$group; app_index[APP_COUNT]=$index_short
+    app_state[APP_COUNT]=$state; app_running[APP_COUNT]=$running; app_writable[APP_COUNT]=$writable
+    app_managed[APP_COUNT]=$managed; app_adoptable[APP_COUNT]=$adopt_safe; app_extra[APP_COUNT]=$extra
+    app_helpers[APP_COUNT]=$helper_count; app_in_apps[APP_COUNT]=$in_apps
+    app_warning[APP_COUNT]=$(conf_get app "$key" open_warning "")
+    app_links[APP_COUNT]=$link_paths
+    APP_COUNT=$((APP_COUNT + 1))
+  done
+  return 0
+}
+
+index_age_line() {
+  local api newest
+  api="$(brew --cache 2>/dev/null)/api"
+  # shellcheck disable=SC2012 # names here are Homebrew cache files, and only the newest one is shown
+  newest=$(ls -t "$api" 2>/dev/null | head -n 1)
+  if [ -n "$newest" ]; then
+    report_detail "Homebrew index dated $(stat -f '%Sm' "$api/$newest" 2>/dev/null)"
+  else
+    report_detail "Homebrew index date unknown"
+  fi
+}
+
+print_inventory() {
+  local i source
+  report_detail "$(printf '%-24s %-16s %-12s %-12s %-9s %-10s %-4s %-8s %s' App Installed Index State Group Cask Run Writable Managed)"
+  i=0
+  while [ "$i" -lt "$APP_COUNT" ]; do
+    source=${app_source[$i]}
+    case $source in
+      config) source=confirmed ;;
+      installed|guess) source=proposed ;;
+      none) source="-" ;;
+    esac
+    report_detail "$(printf '%-24s %-16s %-12s %-12s %-9s %-10s %-4s %-8s %s' "${app_name[$i]}" "${app_version[$i]:0:16}" "${app_index[$i]:0:12}" "${app_state[$i]}" "${app_group[$i]}" "$source" "${app_running[$i]}" "${app_writable[$i]}" "${app_managed[$i]}")"
+    i=$((i + 1))
+  done
+  report_detail "Groups. system: macOS updates it. vendor: its maker updates it in the background. silent: Homebrew may upgrade it unattended when it is closed. assisted: only an interactive pass upgrades it, for example one with an installer package, a background helper, a bundle or link folder this account cannot write, or a file in the way of a link. manual: update it from inside the app."
+  report_detail "Cask. confirmed: named in your config. proposed: found automatically and report-only until you confirm it with setup."
+}
+
+report_mapping() {
+  local i proposed="" unmapped="" count=0
+  i=0
+  while [ "$i" -lt "$APP_COUNT" ]; do
+    if [ "${app_confirmed[$i]}" = no ] && [ -n "${app_token[$i]}" ]; then
+      list_add proposed "${app_name[$i]} (${app_token[$i]})"
+      count=$((count + 1))
+    elif [ -z "${app_token[$i]}" ]; then
+      case ${app_group[$i]} in
+        system|vendor) ;;
+        *) list_add unmapped "${app_name[$i]}" ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  PROPOSED_COUNT=$count
+  if [ "$count" -gt 0 ]; then
+    report_detail "$count app(s) have a proposed cask; run setup to confirm them: $proposed"
+  fi
+  if [ -n "$unmapped" ]; then
+    report_detail "No cask found for: $unmapped. To manage one, add an [app BUNDLE_ID] section with cask = TOKEN to $CONFIG_FILE"
+  fi
+}
+
+# pgrep exits 1 when nothing matches and above 1 when it failed. An app whose
+# state is unknown counts as running, so it is never replaced while in use.
+# Any process started from inside the bundle counts, so a login item or helper
+# under Contents/Library or Contents/Frameworks keeps the app from being replaced.
+app_is_running() {
+  local status
+  pgrep -q -f "^$(ere_escape "$1")/"
+  status=$?
+  [ "$status" -ne 1 ]
+}
+
+staged_blocker() {
+  local token=$1 dir entry
+  [ -n "$token" ] && [ -n "$CASKROOM" ] || return 1
+  for dir in "$CASKROOM/$token"/*/; do
+    [ -d "$dir" ] || continue
+    case $dir in
+      */.metadata/) continue ;;
+    esac
+    for entry in "$dir"*.app; do
+      [ -e "$entry" ] || continue
+      [ -L "$entry" ] && continue
+      printf '%s' "$entry"
+      return 0
+    done
+  done
+  return 1
+}
+
+# Homebrew removes only a link at these paths before it links the new version,
+# so anything else there fails the upgrade, and its revert, and the undoing of
+# that revert removes the app (cask/installer.rb install_artifacts and
+# revert_upgrade). The same holds for a file where one of the path's folders
+# should be, since Homebrew cannot create that folder (cask/utils.rb
+# gain_permissions_mkpath). It prints the first path in the way, +PATH for such
+# a file, or ?TEXT for a path that could not be placed, a relative one included.
+link_in_the_way() {
+  local rest=$1 entry dir
+  while [ -n "$rest" ]; do
+    entry=${rest%%"$LINK_SEP"*}
+    if [ "$entry" = "$rest" ]; then rest=""; else rest=${rest#*"$LINK_SEP"}; fi
+    case $entry in
+      '') continue ;;
+      '?'*) printf '%s' "$entry"; return 0 ;;
+      /*) ;;
+      *) printf '?%s' "$entry"; return 0 ;;
+    esac
+    if [ -e "$entry" ] && [ ! -L "$entry" ]; then
+      printf '%s' "$entry"
+      return 0
+    fi
+    dir=${entry%/*}
+    while [ -n "$dir" ] && [ ! -d "$dir" ]; do
+      if [ -e "$dir" ] || [ -L "$dir" ]; then
+        printf '+%s' "$dir"
+        return 0
+      fi
+      dir=${dir%/*}
+    done
+  done
+  return 1
+}
+
+# Homebrew makes a link with sudo when the link's folder, or the nearest
+# folder above it that exists, is not writable (cask/artifact/symlinked.rb
+# create_filesystem_link, cask/utils.rb gain_permissions_mkpath). The
+# unattended pass has no terminal to answer sudo, and a link that fails there
+# takes the same road as a file in the way, so such an app waits for a person.
+# It prints that folder.
+link_folder_needs_admin() {
+  local rest=$1 entry dir
+  while [ -n "$rest" ]; do
+    entry=${rest%%"$LINK_SEP"*}
+    if [ "$entry" = "$rest" ]; then rest=""; else rest=${rest#*"$LINK_SEP"}; fi
+    case $entry in
+      /*) ;;
+      *) continue ;;
+    esac
+    dir=${entry%/*}
+    while [ -n "$dir" ] && [ ! -d "$dir" ]; do dir=${dir%/*}; done
+    dir=${dir:-/}
+    if [ ! -w "$dir" ]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+link_block_text() {
+  local name=$1 blocker=$2
+  case $blocker in
+    '?'*)
+      printf "%s: Homebrew's entry names a link this tool cannot place (%s), so it is neither adopted nor upgraded here" "$name" "${blocker#?}"
+      ;;
+    '+'*)
+      printf '%s: %s is a file, not a folder, where Homebrew needs a folder for a link it makes for this app (a command, a shell completion or a man page). Homebrew would fail the upgrade, and undoing that failure can remove the app, so %s is neither adopted nor upgraded. Move that file aside, then rerun' "$name" "${blocker#+}" "$name"
+      ;;
+    *)
+      printf '%s: %s is a file, not a link, where Homebrew puts a link for this app (a command, a shell completion or a man page). Homebrew would fail the upgrade, and undoing that failure can remove the app, so %s is neither adopted nor upgraded. Move that file aside, then rerun' "$name" "$blocker" "$name"
+      ;;
+  esac
+}
+
+# The paths are checked again at the moment of use, so a file that appeared
+# after the inventory still stops the upgrade, and the failure recorded here
+# makes the pass ask for a person instead of reporting that nothing needs them.
+upgrade_blocked_by_link() {
+  local i=$1 blocker
+  blocker=$(link_in_the_way "${app_links[$i]}") || return 1
+  report_failure "$(link_block_text "${app_name[$i]}" "$blocker")" "in-the-way(${app_name[$i]})"
+  return 0
+}
+
+# An app is asked to quit here and nowhere else, by its own quit handler, so
+# unsaved work gets the app's own save dialog and an app that stays open is
+# left alone.
+quit_app_gracefully() {
+  local bundle=$1 name=$2 path=$3 waited=0 poll=2
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would ask $name to quit"
+    return 1
+  fi
+  if [ "$MODE" = auto ]; then
+    report_skipped "$name is running; the unattended pass never quits an app"
+    return 1
+  fi
+  if ! bundle_id_ok "$bundle"; then
+    report_skipped "$name has an unexpected bundle id, so it is not asked to quit"
+    return 1
+  fi
+  report_detail "Asking $name to quit its own way; unsaved work gets its save dialog"
+  osascript -e "tell application id \"$bundle\" to quit" >>"$RUN_SINK" 2>&1
+  while app_is_running "$path"; do
+    if [ "$waited" -ge "$QUIT_WAIT" ]; then
+      report_skipped "$name did not quit within $QUIT_WAIT seconds; left running and unchanged"
+      return 1
+    fi
+    sleep "$poll"
+    waited=$((waited + poll))
+  done
+  return 0
+}
+
+# An app is launched here and nowhere else, so the dry-run guard and the
+# bundle-id check below cover every launch.
+reopen_app() {
+  local bundle=$1 name=$2 note=${3:-reopened}
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would open $name"
+    return 0
+  fi
+  if ! bundle_id_ok "$bundle"; then
+    report_warning "$name has an unexpected bundle id; start it from the Dock yourself"
+    return 1
+  fi
+  if open -b "$bundle" >>"$RUN_SINK" 2>&1; then
+    report_success "$name $note"
+    return 0
+  fi
+  report_warning "$name could not be launched. Start it from the Dock yourself"
+  return 1
+}
+
+# Replacing an app bundle is never stopped part-way: a killed replacement is
+# what leaves a half-moved app behind. The command starts with HUP, INT and
+# TERM ignored, so closing the window, Control-C or a TERM to the window's
+# group ends this pass but not the replacement. Only KILL, which nothing can
+# ignore, still stops it. It stays in the window's process group on purpose: a
+# password prompt from Homebrew must still be able to read the terminal.
+run_never_killed() {
+  local label=$1 pid started last_warn
+  shift
+  ( trap '' HUP INT TERM; exec "$@" ) >>"$RUN_SINK" 2>&1 8<&- 9>&- &
+  pid=$!
+  started=$SECONDS
+  last_warn=$SECONDS
+  while ps -p "$pid" >/dev/null 2>&1; do
+    if [ $((SECONDS - last_warn)) -ge "$SLOW_WARN" ]; then
+      report_warning "$label is still running after $(report_duration $((SECONDS - started))); it is never stopped part-way, so this pass waits"
+      last_warn=$SECONDS
+    fi
+    sleep 1
+  done
+  wait "$pid"
+}
+
+UPGRADED_COUNT=0
+SKIPPED_RUNNING=""
+SKIPPED_UNWRITABLE=""
+PENDING_ASSISTED=""
+STALE_RECORD=""
+TOUCHED_THIS_PASS=" "
+PROPOSED_COUNT=0
+
+# An app is upgraded here and nowhere else, so the refusals below cover every
+# upgrade, whatever mode asked for it.
+upgrade_cask() {
+  local i=$1 token name path bundle was_running=0 version_after staged
+  token=${app_token[$i]}; name=${app_name[$i]}; path=${app_path[$i]}; bundle=${app_open[$i]}
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would upgrade $name with Homebrew (cask $token)"
+    return 0
+  fi
+  if [ "${app_confirmed[$i]}" != yes ]; then
+    report_skipped "$name is not confirmed in the config; report only"
+    return 0
+  fi
+  if [ ! -w "$path" ] || [ ! -w "${path%/*}" ]; then
+    report_skipped "$name is not writable by this account, so macOS would refuse Homebrew even with sudo. Its own updater keeps it current"
+    list_add SKIPPED_UNWRITABLE "$name"
+    return 0
+  fi
+  staged=$(staged_blocker "$token")
+  if [ -n "$staged" ]; then
+    report_failure "$name has a leftover copy where Homebrew expects a link, so every upgrade stops before it starts. Move it aside by hand: $staged" "in-the-way($name)"
+    return 0
+  fi
+  if app_is_running "$path"; then
+    if [ "$MODE" = auto ]; then
+      report_skipped "$name is running; the unattended pass never quits an app, so it waits for you"
+      list_add SKIPPED_RUNNING "$name"
+      return 0
+    fi
+    if ! prompt_consent "$name is running. Ask it to quit its own way, upgrade it, and reopen it?" no; then
+      report_skipped "$name left running and unchanged"
+      list_add SKIPPED_RUNNING "$name"
+      return 0
+    fi
+    if ! quit_app_gracefully "$bundle" "$name" "$path"; then
+      list_add SKIPPED_RUNNING "$name"
+      return 0
+    fi
+    was_running=1
+  fi
+  if app_is_running "$path"; then
+    report_skipped "$name started again meanwhile; left unchanged"
+    list_add SKIPPED_RUNNING "$name"
+    return 0
+  fi
+  if [ "${app_helpers[$i]}" -gt 0 ]; then
+    report_detail "$name's cask names ${app_helpers[$i]} background helper(s); Homebrew may ask for the administrator password"
+  fi
+  if upgrade_blocked_by_link "$i"; then
+    [ "$was_running" = 0 ] || reopen_app "$bundle" "$name"
+    return 0
+  fi
+  report_detail "Homebrew upgrade of cask $token"
+  if run_never_killed "Homebrew upgrade of $name" brew upgrade --cask "$token"; then
+    TOUCHED_THIS_PASS="$TOUCHED_THIS_PASS$i "
+    version_after=$(plutil -extract CFBundleShortVersionString raw -o - "$path/Contents/Info.plist" 2>/dev/null)
+    if [ ! -r "$path/Contents/Info.plist" ]; then
+      report_failure "$name is missing or unreadable at $path although Homebrew reported success; check the app before you use it" "upgrade($name)"
+    elif [ -n "$version_after" ] && [ "$version_after" != "${app_version[$i]}" ]; then
+      report_success "$name upgraded ${app_version[$i]} to $version_after"
+      apps_ledger_add upgraded "$name" "${app_version[$i]} to $version_after"
+      app_version[i]=$version_after
+      app_state[i]=same
+      UPGRADED_COUNT=$((UPGRADED_COUNT + 1))
+    else
+      report_warning "$name unchanged at ${app_version[$i]}: Homebrew's record already matches the index, so it catches up at the app's next release. To catch up now, update once inside the app"
+    fi
+  else
+    apps_ledger_add upgrade-failed "$name" "${app_version[$i]}"
+    if [ ! -r "$path/Contents/Info.plist" ]; then
+      report_failure "$name upgrade failed, and $name is now missing or unreadable at $path: Homebrew's rollback of a failed upgrade can remove the app. Check it before you use it; details in the run log" "upgrade($name)"
+    else
+      report_failure "$name upgrade failed; details in the run log" "upgrade($name)"
+    fi
+  fi
+  if [ "$was_running" = 1 ]; then
+    reopen_app "$bundle" "$name"
+  fi
+  return 0
+}
+
+# An app is adopted here and nowhere else, so the checks below cover every
+# adoption. Adoption records an app that is already installed; the bundle
+# itself stays where it is.
+adopt_cask() {
+  local i=$1 token name
+  token=${app_token[$i]}; name=${app_name[$i]}
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would adopt $name into Homebrew (cask $token)"
+    return 0
+  fi
+  if [ "${app_confirmed[$i]}" != yes ] || [ "${app_adoptable[$i]}" != yes ] || [ "${app_writable[$i]}" != yes ] || [ "${app_in_apps[$i]}" != yes ]; then
+    report_skipped "$name is not adopted: it must be confirmed, writable, directly inside $APPLICATIONS_DIR, and its cask must have no step Homebrew could roll back"
+    return 1
+  fi
+  report_detail "Homebrew adoption of cask $token, without its command-line links; its next upgrade adds them"
+  if run_never_killed "Homebrew adoption of $name" brew install --cask --adopt --no-binaries "$token"; then
+    report_success "$name is now managed by Homebrew"
+    apps_ledger_add adopted "$name" "${app_version[$i]}"
+    app_managed[i]=yes
+    return 0
+  fi
+  report_failure "$name could not be adopted; details in the run log" "adopt($name)"
+  return 1
+}
+
+OUTDATED_TOKENS=""
+
+query_outdated() {
+  local json status
+  OUTDATED_TOKENS=""
+  json=$(capture_with_deadline "$QUERY_TIMEOUT" brew outdated --cask --json=v2 2>>"$RUN_SINK")
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    report_failure "Homebrew could not say which casks are outdated (status $status); no app is compared this run" "query(outdated)"
+    return 1
+  fi
+  if ! OUTDATED_TOKENS=$(printf '%s' "$json" | jq -r '.casks | if type == "array" then .[] | (.name // .token) else error("unexpected shape") end' 2>>"$RUN_SINK"); then
+    OUTDATED_TOKENS=""
+    report_failure "The outdated-cask answer did not have the expected shape; no app is compared this run" "query(outdated)"
+    return 1
+  fi
+  return 0
+}
+
+outdated_indices() {
+  local token i found=""
+  for token in $OUTDATED_TOKENS; do
+    i=0
+    while [ "$i" -lt "$APP_COUNT" ]; do
+      if [ "${app_token[$i]}" = "$token" ] && [ "${app_confirmed[$i]}" = yes ] && [ "${app_managed[$i]}" = yes ]; then
+        found="$found $i"
+      fi
+      i=$((i + 1))
+    done
+  done
+  printf '%s' "$found"
+}
+
+# This is only valid after a successful query_outdated: an app brew outdated
+# lists is not stale, whatever its group, so the caller passes those indices
+# to skip.
+report_stale_records() {
+  local skip=" $1 " i
+  i=0
+  while [ "$i" -lt "$APP_COUNT" ]; do
+    if [ "${app_confirmed[$i]}" = yes ] && [ "${app_managed[$i]}" = yes ] && [ "${app_state[$i]}" = older ]; then
+      case $skip in
+        *" $i "*) ;;
+        *)
+          report_warning "${app_name[$i]} is ${app_version[$i]} against index ${app_index[$i]}, but Homebrew's record already matches the index, so it catches up at the app's next release. To catch up now, update once inside the app"
+          list_add STALE_RECORD "${app_name[$i]}"
+          ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+}
+
+phase_dock_apps() {
+  local i candidates="" candidate_count=0 unmanaged="" query_ok=1 outdated blocked_count=0 confirmed_count=0
+  print_inventory
+  report_mapping
+  if [ "$APP_STEP_ALLOWED" != 1 ]; then
+    report_skipped "App upgrades deferred this run (battery); nothing was touched"
+    return 0
+  fi
+  i=0
+  while [ "$i" -lt "$APP_COUNT" ]; do
+    [ "${app_confirmed[$i]}" != yes ] || confirmed_count=$((confirmed_count + 1))
+    if [ "${app_confirmed[$i]}" = yes ] && [ "${app_managed[$i]}" = no ]; then
+      case ${app_group[$i]} in
+        silent|assisted) list_add unmanaged "${app_name[$i]}" ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  [ -z "$unmanaged" ] || report_warning "Confirmed but not yet managed by Homebrew; run $(self_command) setup once: $unmanaged"
+  query_outdated || query_ok=0
+  outdated=$(outdated_indices)
+  for i in $outdated; do
+    case ${app_group[$i]} in
+      silent|assisted)
+        if upgrade_blocked_by_link "$i"; then
+          blocked_count=$((blocked_count + 1))
+        else
+          candidates="$candidates $i"
+          candidate_count=$((candidate_count + 1))
+        fi
+        ;;
+    esac
+  done
+  [ "$query_ok" = 0 ] || report_stale_records "$outdated"
+  if [ "$candidate_count" = 0 ]; then
+    if [ "$query_ok" = 0 ] || [ "$REPORT_FAILURE_COUNT" -gt "$blocked_count" ]; then
+      report_warning "Not every app could be compared with the index; see the failures above"
+    elif [ "$blocked_count" -gt 0 ]; then
+      report_warning "No app can be upgraded this run; the failures above name what is in the way"
+    elif [ -n "$STALE_RECORD" ]; then
+      report_detail "Nothing for Homebrew to upgrade this run; the apps named above are behind but Homebrew's record already matches"
+    elif [ "$confirmed_count" = 0 ]; then
+      report_detail "No app is confirmed yet, so none is checked for upgrades; confirm one with setup or with a cask line in the config"
+    elif [ "$PROPOSED_COUNT" -gt 0 ]; then
+      report_success "Every confirmed app matches the index; proposed apps are not checked for upgrades until you confirm them"
+    else
+      report_success "Every confirmed app matches the index"
+    fi
+    return 0
+  fi
+  report_detail "$candidate_count confirmed app(s) are older than the index"
+  if [ "$MODE" = auto ]; then
+    for i in $candidates; do
+      if [ "${app_group[$i]}" = silent ]; then
+        if app_is_running "${app_path[$i]}"; then
+          report_skipped "${app_name[$i]} is running; the unattended pass never quits an app, so it waits for you"
+          list_add SKIPPED_RUNNING "${app_name[$i]}"
+        else
+          upgrade_cask "$i"
+        fi
+      elif [ "${app_writable[$i]}" = no ]; then
+        report_skipped "${app_name[$i]} is not writable by this account; its own updater keeps it current"
+        list_add SKIPPED_UNWRITABLE "${app_name[$i]}"
+      else
+        report_skipped "${app_name[$i]} is in the assisted group, so only the interactive run upgrades it"
+        list_add PENDING_ASSISTED "${app_name[$i]}"
+      fi
+    done
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    for i in $candidates; do upgrade_cask "$i"; done
+    return 0
+  fi
+  if prompt_consent "Upgrade these $candidate_count app(s) now? A running app is asked about first; an installer package may ask for your password" no; then
+    for i in $candidates; do upgrade_cask "$i"; done
+  else
+    report_skipped "App upgrades declined"
+  fi
+}
+
+# This counts how many attempts in a row left the app at this version. A
+# did-not-start row cancels the attempt before it, so a launch that failed
+# never counts toward giving up. Versions are compared as strings, so 1.1 is
+# not 1.10.
+nudge_stall_count() {
+  local name=$1 version=$2
+  if [ ! -f "$NUDGE_LEDGER" ]; then
+    printf '0'
+    return 0
+  fi
+  LC_ALL=C awk -F'\t' -v n="$name" -v v="$version" '
+    ($2 "") == (n "") {
+      if ($4 == "did-not-start") { if (count) count--; next }
+      count++; rows[count] = $3 ""
+    }
+    END {
+      streak = 0
+      i = count
+      while (i) {
+        if (rows[i] == (v "")) { streak++; i-- } else { break }
+      }
+      printf "%d", streak
+    }' "$NUDGE_LEDGER"
+}
+
+record_nudge() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  if ! printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "$3" >> "$NUDGE_LEDGER" 2>/dev/null; then
+    report_warning "Could not record the attempt for $1 in $NUDGE_LEDGER"
+  fi
+  return 0
+}
+
+NUDGE_PENDING=""
+NUDGE_RETIRED=""
+MACOS_PENDING=""
+ESCALATION_REASONS=""
+
+# It publishes its lists as globals; a caller that captured stdout instead
+# would run it in a subshell and lose both lists.
+compute_escalation() {
+  local i reasons=""
+  NUDGE_PENDING=""
+  NUDGE_RETIRED=""
+  i=0
+  while [ "$i" -lt "$APP_COUNT" ]; do
+    case $TOUCHED_THIS_PASS in
+      *" $i "*) i=$((i + 1)); continue ;;
+    esac
+    if [ "${app_confirmed[$i]}" = yes ] && [ "${app_state[$i]}" = older ] && [ "${app_running[$i]}" = no ]; then
+      case ${app_group[$i]} in
+        system|vendor) ;;
+        *)
+          if [ "$(nudge_stall_count "${app_name[$i]}" "${app_version[$i]}")" -ge "$NUDGE_GIVE_UP" ]; then
+            NUDGE_RETIRED="$NUDGE_RETIRED $i"
+          else
+            NUDGE_PENDING="$NUDGE_PENDING $i"
+          fi
+          ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  [ -z "$MACOS_PENDING" ] || reasons="${reasons:+$reasons,}macOS"
+  [ -z "$PENDING_ASSISTED" ] || reasons="${reasons:+$reasons,}apps-needing-a-password"
+  [ -z "$NUDGE_PENDING" ] || reasons="${reasons:+$reasons,}apps-to-open"
+  [ -z "$SKIPPED_RUNNING" ] || reasons="${reasons:+$reasons,}running-apps"
+  [ "$REPORT_FAILURE_COUNT" -eq 0 ] || reasons="${reasons:+$reasons,}failed-steps"
+  ESCALATION_REASONS=$reasons
+}
+
+phase_nudge() {
+  local i names="" count=0 opened=""
+  for i in $NUDGE_RETIRED; do
+    report_detail "${app_name[$i]} is not opened any more: it stayed at ${app_version[$i]} through $NUDGE_GIVE_UP attempts. Update it from inside the app, or it catches up at its next release"
+  done
+  if [ -z "$NUDGE_PENDING" ]; then
+    if [ -n "$NUDGE_RETIRED" ]; then
+      report_success "Nothing left to open; the apps above are behind but do not respond to being opened"
+    else
+      report_success "No closed app is behind its index"
+    fi
+    return 0
+  fi
+  if [ "$APP_STEP_ALLOWED" != 1 ]; then
+    report_skipped "Opening apps deferred this run (battery); nothing was opened"
+    return 0
+  fi
+  for i in $NUDGE_PENDING; do
+    list_add names "${app_name[$i]}"
+    count=$((count + 1))
+    [ -z "${app_warning[$i]}" ] || report_warning "${app_name[$i]}: ${app_warning[$i]}"
+  done
+  report_detail "Behind their index and closed: $names"
+  report_detail "Opening an app makes its own updater fetch. The new version applies the next time you quit and relaunch it."
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would ask, then open: $names"
+    return 0
+  fi
+  if ! prompt_consent "Open these $count app(s) now so their own updaters fetch?" no; then
+    report_skipped "No app was opened"
+    return 0
+  fi
+  for i in $NUDGE_PENDING; do
+    record_nudge "${app_name[$i]}" "${app_version[$i]}" attempt
+    reopen_app "${app_open[$i]}" "${app_name[$i]}" "opened; its update applies when you next quit and relaunch it"
+    opened="$opened $i"
+  done
+  [ "$SEAM_FAST" = 1 ] || sleep 5
+  for i in $opened; do
+    if ! app_is_running "${app_path[$i]}"; then
+      report_warning "${app_name[$i]} did not start. Start it from the Dock yourself; this attempt is not counted"
+      record_nudge "${app_name[$i]}" "${app_version[$i]}" did-not-start
+    fi
+  done
+}
+
+MACOS_LISTING=""
+MACOS_ITEMS=""
+
+list_macos_updates() {
+  local status
+  MACOS_ITEMS=""
+  MACOS_LISTING=$(capture_with_deadline "$LIST_TIMEOUT" softwareupdate --list 2>&1)
+  status=$?
+  report_log INFO "softwareupdate --list exited $status; raw listing follows"
+  printf '%s\n' "$MACOS_LISTING" >>"$RUN_SINK" 2>/dev/null
+  if [ "$status" -ne 0 ]; then
+    report_failure "The macOS update listing failed (status $status)" "query(softwareupdate)"
+    return 1
+  fi
+  MACOS_ITEMS=$(printf '%s\n' "$MACOS_LISTING" | LC_ALL=C awk -v sep="$SEP" '
+    /^[*-] Label: / { label = substr($0, 10); bullet = substr($0, 1, 1); next }
+    /^[[:space:]]*Title: / && label != "" {
+      line = $0
+      sub(/^[[:space:]]*Title: /, "", line)
+      title = line
+      sub(/, Version: .*$/, "", title)
+      version = ""
+      if (match(line, /Version: [^,]*/)) version = substr(line, RSTART + 9, RLENGTH - 9)
+      restart = (line ~ /Action: restart/) ? 1 : ((line ~ /Action: shut down/) ? 2 : 0)
+      if (line ~ /Recommended: YES/) recommended = 1
+      else if (line ~ /Recommended: NO/) recommended = 0
+      else recommended = (bullet == "*") ? 1 : 0
+      printf "%s%s%s%s%s%s%s%s%s\n", label, sep, title, sep, version, sep, restart, sep, recommended
+      label = ""
+    }')
+  return 0
+}
+
+macos_pre_release_listed() {
+  printf '%s\n' "$MACOS_LISTING" | grep -i 'beta' >/dev/null && return 0
+  printf '%s\n' "$MACOS_LISTING" | grep -i 'seed' >/dev/null && return 0
+  printf '%s\n' "$MACOS_LISTING" | grep -w 'RC' >/dev/null && return 0
+  return 1
+}
+
+macos_pending_remove() {
+  local title=$1 kept="" item rest
+  rest=$MACOS_PENDING
+  while [ -n "$rest" ]; do
+    item=${rest%%"; "*}
+    if [ "$item" = "$rest" ]; then rest=""; else rest=${rest#*"; "}; fi
+    [ "$item" = "$title" ] || kept="${kept:+$kept; }$item"
+  done
+  MACOS_PENDING=$kept
+}
+
+# A restart is asked for here and nowhere else: the answer defaults to No, the
+# request is on record before the install starts, and No means download only.
+consent_restart() {
+  local label=$1 title=$2 major=$3 version=$4 action=${5:-1}
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would ask before installing \"$title\" with a restart"
+    return 0
+  fi
+  report_warning "Save and close your documents first. Windows may not be restored after the restart."
+  [ "$action" != 2 ] || report_warning "Apple lists \"$title\" as shutting the Mac down when it finishes, not restarting it; a yes below lets it do that."
+  report_detail "The administrator password may be asked again. Installing accepts Apple's license terms for this update on your behalf."
+  if prompt_consent "Install \"$title\" and restart now?" no; then
+    report_history restart-requested "$label"
+    if ! sudo softwareupdate --install "$label" --restart --agree-to-license; then
+      report_failure "\"$title\" did not install" "macos-install"
+      if [ "$major" = major ]; then
+        report_detail "For a major upgrade, the full installer is the documented alternative. Run it yourself if you want it: sudo softwareupdate --fetch-full-installer --full-installer-version $version"
+      fi
+    fi
+  else
+    report_detail "Downloading \"$title\" only; finish it later from System Settings, General, Software Update"
+    sudo softwareupdate --download "$label" --agree-to-license || report_failure "\"$title\" download failed" "macos-download"
+  fi
+}
+
+phase_macos() {
+  local live=$1 current_major label title version restart recommended major n k shown
+  local -a plain_labels plain_titles restart_labels restart_titles restart_major restart_versions restart_actions
+  current_major=$(sw_vers -productVersion 2>/dev/null | cut -d . -f 1)
+  list_macos_updates || return 0
+  if printf '%s\n' "$MACOS_LISTING" | grep 'No new software available' >/dev/null; then
+    report_success "macOS is current: no new software available"
+    return 0
+  fi
+  if [ -z "$MACOS_ITEMS" ]; then
+    report_failure "The macOS update listing was neither \"No new software available\" nor a list this tool can read, so pending updates are unknown this run${REPORT_RUN_LOG:+; the raw listing is in $REPORT_RUN_LOG}" "query(softwareupdate)"
+    return 0
+  fi
+  if macos_pre_release_listed; then
+    report_warning "A pre-release item is listed, so nothing is installed this week. Check System Settings, General, Software Update, Beta Updates"
+    report_failure "a pre-release item is listed" "macos(pre-release-listed)"
+    return 0
+  fi
+  n=0
+  while IFS=$SEP read -r label title version restart recommended; do
+    [ -n "$label" ] || continue
+    major=minor
+    case $title in
+      macOS*)
+        case $version in
+          [0-9]*)
+            if util_is_uint "${version%%.*}" && util_is_uint "$current_major" && [ "${version%%.*}" -gt "$current_major" ]; then
+              major=major
+            fi
+            ;;
+        esac
+        ;;
+    esac
+    if [ "$recommended" != 1 ]; then
+      report_skipped "$title ${version:-(no version)} is listed but not recommended; left alone"
+      continue
+    fi
+    shown=$restart
+    [ "$restart" != 2 ] || shown=shut-down
+    report_detail "$(printf '%-44s %-10s restart:%s %s' "$title" "${version:--}" "$shown" "$major")"
+    MACOS_PENDING="${MACOS_PENDING:+$MACOS_PENDING; }$title"
+    if [ "$restart" != 0 ]; then
+      restart_labels[n]=$label; restart_titles[n]=$title; restart_major[n]=$major; restart_versions[n]=$version; restart_actions[n]=$restart
+    else
+      plain_labels[n]=$label; plain_titles[n]=$title
+    fi
+    n=$((n + 1))
+  done <<EOF
+$MACOS_ITEMS
+EOF
+  [ "$live" = live ] || return 0
+  if [ "$n" -eq 0 ]; then
+    report_success "Nothing recommended to install"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would install the $n recommended item(s) above after asking; any restart needs its own yes"
+    return 0
+  fi
+  if [ "$MACOS_STEP_ALLOWED" != 1 ]; then
+    report_skipped "macOS installs skipped this run (battery or administrator rights)"
+    return 0
+  fi
+  if ! prompt_consent "Install the $n recommended macOS update(s) listed above? This needs the administrator password and accepts Apple's license terms for them; a restart asks again" no; then
+    report_skipped "macOS updates left for later; nothing was installed or downloaded"
+    return 0
+  fi
+  report_detail "The administrator password is needed now"
+  if ! sudo -v; then
+    report_failure "administrator authentication failed; macOS installs skipped" "macos-auth"
+    return 0
+  fi
+  if sudo -n true 2>/dev/null; then
+    report_detail "sudo remembers the password for a while here, so the installs below should not ask again"
+  else
+    report_detail "sudo does not remember the password here, so each install below may ask again"
+  fi
+  k=0
+  while [ "$k" -lt "$n" ]; do
+    if [ -n "${plain_labels[$k]:-}" ]; then
+      report_detail "Installing \"${plain_titles[$k]}\" (no restart needed; this accepts Apple's license terms for it)"
+      if sudo softwareupdate --install "${plain_labels[$k]}" --agree-to-license; then
+        report_success "\"${plain_titles[$k]}\" installed"
+        macos_pending_remove "${plain_titles[$k]}"
+      else
+        report_failure "\"${plain_titles[$k]}\" did not install" "macos-install"
+      fi
+    fi
+    k=$((k + 1))
+  done
+  k=0
+  while [ "$k" -lt "$n" ]; do
+    if [ -n "${restart_labels[$k]:-}" ]; then
+      consent_restart "${restart_labels[$k]}" "${restart_titles[$k]}" "${restart_major[$k]}" "${restart_versions[$k]}" "${restart_actions[$k]}"
+    fi
+    k=$((k + 1))
+  done
+}
+
+user_is_at_the_mac() {
+  pmset -g assertions 2>/dev/null | grep -E 'UserIsActive[^0-9]+1' >/dev/null
+}
+
+# The unattended pass opens a window here and nowhere else, through the
+# launcher, which execs this runtime in scheduled mode because open cannot pass
+# a mode to a script.
+open_window() {
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Would open a Terminal window that asks before doing anything"
+    return 0
+  fi
+  if [ ! -x "$SHIM" ]; then
+    report_failure "The window launcher $SHIM is missing; run install.sh again" "window"
+    return 1
+  fi
+  if open -a Terminal "$SHIM" >>"$RUN_SINK" 2>&1; then
+    return 0
+  fi
+  report_failure "No window could be opened" "window"
+  return 1
+}
+
+joined_indices() {
+  local i out=""
+  for i in $1; do
+    out="${out:+$out, }${app_name[$i]}"
+  done
+  printf '%s' "$out"
+}
+
+pass_detail() {
+  printf 'reasons=%s upgraded=%s failures=%s running-skipped=[%s] unwritable=[%s] assisted-pending=[%s] macos-pending=[%s] proposed=%s' \
+    "${ESCALATION_REASONS:--}" "$UPGRADED_COUNT" "$(printf '%s' "${REPORT_FAILURE_TAGS:--}" | tr ' ' ',')" \
+    "$SKIPPED_RUNNING" "$SKIPPED_UNWRITABLE" "$PENDING_ASSISTED" "$MACOS_PENDING" "$PROPOSED_COUNT"
+}
+
+print_summary() {
+  if [ "$REPORT_FAILURE_COUNT" -eq 0 ]; then
+    report_success "Finished in $(report_duration $(( $(date '+%s') - RUN_STARTED_AT ))): $UPGRADED_COUNT app(s) upgraded"
+  else
+    report_warning "Finished with issues: $REPORT_FAILURE_TAGS"
+  fi
+  [ -z "$SKIPPED_RUNNING" ] || report_detail "Skipped because running: $SKIPPED_RUNNING"
+  [ -z "$SKIPPED_UNWRITABLE" ] || report_detail "Left to their own updaters, bundle not writable: $SKIPPED_UNWRITABLE"
+  [ -z "$STALE_RECORD" ] || report_detail "Behind the index but Homebrew's record already matches: $STALE_RECORD"
+  [ -z "$NUDGE_RETIRED" ] || report_detail "Opening does not move these; update them from inside the app: $(joined_indices "$NUDGE_RETIRED")"
+  [ -z "$PENDING_ASSISTED" ] || report_detail "Need the interactive run: $PENDING_ASSISTED"
+  [ -z "$MACOS_PENDING" ] || report_detail "macOS pending: $MACOS_PENDING"
+}
+
+RUN_STARTED_AT=$(date '+%s')
+RUN_SINK=/dev/null
+LEDGERS_WRITABLE=0
+
+start_run_log() {
+  if [ "$DRY_RUN" = 1 ]; then
+    return 0
+  fi
+  REPORT_RUN_LOG=$LOG_DIR/run-$(date '+%Y%m%d-%H%M%S')-$MODE.log
+  RUN_SINK=$REPORT_RUN_LOG
+}
+
+banner() {
+  local title="WEEKLY UPDATE  .  $MODE"
+  case $MODE in
+    check|status) title="$title  .  report only, nothing changes" ;;
+    *) [ "$DRY_RUN" != 1 ] || title="$title  .  dry run, nothing changes" ;;
+  esac
+  term_banner "$title" "macOS . Dock apps . Homebrew . update-only"
+}
+
+# The redirect sits inside the command, not around the call: a signal trap runs
+# with the caller's redirections, and the interrupt banner belongs on the screen.
+# shellcheck disable=SC2329 # called by name through lifecycle_run_with_deadline
+brew_update_to_log() {
+  exec >>"$RUN_SINK" 2>&1
+  brew update
+}
+
+refresh_index() {
+  if lifecycle_run_with_deadline "$INDEX_TIMEOUT" brew_update_to_log; then
+    report_success "Homebrew index refreshed"
+    return 0
+  fi
+  report_warning "Homebrew index refresh failed or took longer than $INDEX_TIMEOUT seconds"
+  return 1
+}
+
+run_full_pass() {
+  term_phase_heading "1/6" "Preflight"
+  preflight
+  if [ "$MODE" = scheduled ]; then
+    report_history started "window pass"
+  fi
+  term_phase_heading "2/6" "Homebrew index"
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Dry run: the index is not refreshed"
+    index_age_line
+  elif ! refresh_index; then
+    report_failure "The Homebrew index could not be refreshed; the pass uses the cached one" "index"
+  fi
+  term_phase_heading "3/6" "Dock apps"
+  load_dock_inventory
+  phase_dock_apps
+  term_phase_heading "4/6" "Apps that update themselves"
+  compute_escalation
+  phase_nudge
+  term_phase_heading "5/6" "macOS"
+  phase_macos live
+  term_phase_heading "6/6" "Summary"
+  print_summary
+}
+
+pass_outcome() {
+  if [ "$REPORT_FAILURE_COUNT" -eq 0 ]; then
+    PASS_OUTCOME=completed
+    PASS_STATUS=0
+  else
+    PASS_OUTCOME=partial
+    PASS_STATUS=1
+  fi
+}
+
+mode_run() {
+  start_run_log
+  banner
+  heartbeat_check
+  run_full_pass
+  pass_outcome
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '\n  Dry run finished; nothing was changed and nothing was written.\n\n'
+    exit 0
+  fi
+  report_verdict "$PASS_OUTCOME" "$PASS_STATUS" "$(pass_detail)"
+}
+
+last_escalation_reasons() {
+  [ -f "$HISTORY_FILE" ] || return 0
+  LC_ALL=C awk -F'\t' -v day="$(date '+%Y-%m-%d')" '
+    index($1, day) == 1 && $2 == "auto" && ($3 == "escalated" || $3 == "escalation deferred") { last = $4 }
+    END { n = split(last, parts, " "); for (i = 1; i <= n; i++) if (index(parts[i], "reasons=") == 1) print substr(parts[i], 9) }' "$HISTORY_FILE"
+}
+
+# A window nobody asked for must never act on its own: this is the one mode
+# with an entry question, and timeout, end of input, a no or a closed window
+# all leave the Mac as it was.
+mode_scheduled() {
+  local reasons
+  start_run_log
+  banner
+  reasons=$(last_escalation_reasons)
+  report_detail "This window opened by itself, from the weekly update schedule."
+  report_detail "Waiting for you: ${reasons:-work that needs your password or your consent}."
+  report_detail "Yes starts the pass, which asks again before it quits an app itself, installs macOS updates (which needs your administrator password), or restarts."
+  report_detail "No, closing this window, or leaving it for $(report_duration "$ENTRY_WAIT") all change nothing."
+  trap 'report_verdict declined 0 "window closed before an answer"' INT TERM HUP
+  if ! prompt_timed "Run the weekly update now?" "$ENTRY_WAIT"; then
+    report_verdict declined 0 "answer=$PROMPT_OUTCOME"
+  fi
+  lifecycle_install_traps
+  heartbeat_check
+  run_full_pass
+  pass_outcome
+  lifecycle_release_awake
+  lifecycle_release_lock
+  report_detail "Lock released, and keep-awake stops now or at the latest when this run ends; this window only waits for you now"
+  trap 'report_verdict "$PASS_OUTCOME" "$PASS_STATUS" "$(pass_detail) closed=window"' INT TERM HUP
+  printf '\n    Press Return to close this window ' >&2
+  report_log INFO "final prompt open for $FINAL_PROMPT_TIMEOUT seconds"
+  if read -r -t "$FINAL_PROMPT_TIMEOUT" <&8 2>/dev/null; then
+    report_verdict "$PASS_OUTCOME" "$PASS_STATUS" "$(pass_detail) closed=return"
+  fi
+  printf '\n' >&2
+  report_verdict "$PASS_OUTCOME" "$PASS_STATUS" "$(pass_detail) closed=timeout"
+}
+
+dry_run_decision() {
+  if [ "$BATTERY_DEFERRED" = 1 ]; then
+    report_detail "A real slot would defer: on battery below $BATTERY_FLOOR percent"
+  elif [ -z "$ESCALATION_REASONS" ]; then
+    report_detail "A real slot would record completed and notify that nothing needs you"
+  elif user_is_at_the_mac; then
+    report_detail "Someone is at the Mac (UserIsActive 1), so a real slot would open a window for: $ESCALATION_REASONS"
+  else
+    report_detail "Nobody is at the Mac (UserIsActive 0), so a real slot would defer the window for: $ESCALATION_REASONS"
+  fi
+  printf '\n  Dry run finished; nothing was changed and nothing was written.\n\n'
+  exit 0
+}
+
+# The history row is written only here, after the escalation decision, so the
+# row always names what really happened: a deferral stays retryable.
+auto_finish() {
+  local status=0
+  [ "$DRY_RUN" != 1 ] || dry_run_decision
+  [ "$REPORT_FAILURE_COUNT" -eq 0 ] || status=1
+  # A retried window carries the failures of the slot that deferred it.
+  case ,$ESCALATION_REASONS, in
+    *,failed-steps,*) status=1 ;;
+  esac
+  if [ "$BATTERY_DEFERRED" = 1 ]; then
+    if slot_left_today; then
+      notify "Deferred: on battery below $BATTERY_FLOOR percent, nothing was touched. A later slot retries."
+      report_verdict "battery deferred" 0 "a later slot retries"
+    fi
+    notify "Deferred: on battery below $BATTERY_FLOOR percent, nothing was touched. No slot is left today; next pass $(next_fire_time)."
+    report_verdict "battery deferred" 0 "no slot is left today"
+  fi
+  if [ -z "$ESCALATION_REASONS" ]; then
+    notify "Done: $UPGRADED_COUNT app(s) upgraded. Nothing needs you."
+    report_verdict completed 0 "$(pass_detail)"
+  fi
+  if ! user_is_at_the_mac; then
+    if slot_left_today; then
+      notify "Waiting for you: $ESCALATION_REASONS. A later slot today opens a window if you are at the Mac."
+    else
+      notify "Waiting for you: $ESCALATION_REASONS. No slot is left today; next pass $(next_fire_time). When you are back, open Terminal and run: $(self_command)"
+    fi
+    report_verdict "escalation deferred" "$status" "$(pass_detail)"
+  fi
+  if open_window; then
+    report_verdict escalated "$status" "$(pass_detail)"
+  fi
+  notify "Needs you: $ESCALATION_REASONS. Open Terminal and run: $(self_command)"
+  report_verdict partial 1 "$(pass_detail)"
+}
+
+# Auto is one of several hourly slots. The Mac is often asleep at the first
+# ones, so a slot is cheap and stands down once a pass has finished on or after
+# the slot day, and a slot that cannot refresh the index defers instead of
+# deciding on stale data.
+mode_auto() {
+  local last_row reasons day
+  export HOMEBREW_NO_UPGRADE_QUIT_CASKS=1
+  if pass_finished_since_slot_day; then
+    day=$(slot_day)
+    if [ "$DRY_RUN" = 1 ]; then
+      printf 'A pass already finished on or after %s, the last slot day, so a real slot would stand down. The plan below is shown anyway.\n' "$day"
+    else
+      report_verdict "slot skipped" 0 "a pass already finished on or after $day, the last slot day"
+    fi
+  fi
+  last_row=$(last_pass_row_today)
+  start_run_log
+  banner
+  heartbeat_check
+  term_phase_heading "1/5" "Preflight"
+  preflight
+  if [ "$BATTERY_DEFERRED" = 1 ] && [ "$DRY_RUN" != 1 ]; then
+    auto_finish
+  fi
+  case $last_row in
+    "escalation deferred"$'\t'*)
+      reasons=$(last_escalation_reasons)
+      if [ -n "$reasons" ]; then
+        term_phase_heading "2/5" "Retry"
+        report_detail "An earlier slot today deferred a window for: $reasons. Nothing is upgraded again; only the presence check and the window are retried."
+        ESCALATION_REASONS=$reasons
+        auto_finish
+      fi
+      ;;
+  esac
+  term_phase_heading "2/5" "Homebrew index"
+  if [ "$DRY_RUN" = 1 ]; then
+    report_detail "Dry run: the index is not refreshed"
+    index_age_line
+  elif ! refresh_index; then
+    report_warning "On a scheduled slot this usually means the Mac woke briefly without a network, so nothing is decided on stale data"
+    if slot_left_today; then
+      notify "Deferred: the Homebrew index could not be refreshed, often because the Mac woke without a network. A later slot retries."
+    else
+      notify "Deferred: the Homebrew index could not be refreshed and no slot is left today. If this repeats, run brew update in Terminal to see why."
+    fi
+    report_verdict "slot deferred" 0 "index unavailable"
+  fi
+  term_phase_heading "3/5" "Dock apps"
+  load_dock_inventory
+  phase_dock_apps
+  term_phase_heading "4/5" "macOS"
+  phase_macos dry
+  term_phase_heading "5/5" "Summary"
+  compute_escalation
+  print_summary
+  auto_finish
+}
+
+append_config_row() {
+  local bundle=$1 token=$2
+  mkdir -p "${CONFIG_FILE%/*}" || return 1
+  if [ ! -e "$CONFIG_FILE" ]; then
+    printf '# weekly-update config. Every key is described in config/weekly-update.conf.example.\n' >> "$CONFIG_FILE" || return 1
+  fi
+  printf '\n[app %s]\ncask = %s\n' "$bundle" "$token" >> "$CONFIG_FILE"
+}
+
+mode_setup() {
+  local i adopted=0 confirmed=0 plist asked=" " confirmed_tiles=" " offered=" " blocker
+  start_run_log
+  banner
+  term_phase_heading "1/5" "Preflight"
+  preflight
+  term_phase_heading "2/5" "Schedule"
+  plist=$LAUNCH_AGENTS/$(agent_label).plist
+  if [ -f "$plist" ]; then
+    report_success "The schedule is installed at $plist; next pass $(next_fire_time)"
+  else
+    report_detail "The schedule is not installed. Loading it is install.sh's job: run ./install.sh from the folder you downloaded"
+  fi
+  term_phase_heading "3/5" "Confirm proposed casks"
+  load_dock_inventory
+  print_inventory
+  i=0
+  while [ "$i" -lt "$APP_COUNT" ]; do
+    if [ "${app_confirmed[$i]}" = no ] && [ -n "${app_token[$i]}" ]; then
+      # Two Dock tiles can carry one bundle id; a second [app] section for it
+      # would make the config invalid and stop every mode.
+      case $asked in
+        *" ${app_tile[$i]} "*)
+          case $confirmed_tiles in
+            *" ${app_tile[$i]} "*) app_confirmed[i]=yes; app_source[i]=config ;;
+          esac
+          i=$((i + 1))
+          continue
+          ;;
+      esac
+      asked="$asked${app_tile[$i]} "
+      if prompt_consent "Confirm ${app_name[$i]} as cask ${app_token[$i]} in your config?" no; then
+        if append_config_row "${app_tile[$i]}" "${app_token[$i]}"; then
+          report_success "${app_name[$i]} confirmed as ${app_token[$i]} in $CONFIG_FILE"
+          app_confirmed[i]=yes
+          app_source[i]=config
+          confirmed_tiles="$confirmed_tiles${app_tile[$i]} "
+          confirmed=$((confirmed + 1))
+        else
+          report_failure "Could not append ${app_name[$i]} to $CONFIG_FILE" "config"
+        fi
+      else
+        report_skipped "${app_name[$i]} stays report-only"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  term_phase_heading "4/5" "Adopt confirmed apps into Homebrew"
+  if [ "$APP_STEP_ALLOWED" != 1 ]; then
+    report_skipped "Adoption skipped this run (battery); nothing was touched"
+  else
+    report_detail "Adoption records an app that is already installed. Homebrew downloads it once to register it; the app in $APPLICATIONS_DIR stays as it is."
+    i=0
+    while [ "$i" -lt "$APP_COUNT" ]; do
+      case $offered in
+        *" ${app_token[$i]} "*) i=$((i + 1)); continue ;;
+      esac
+      if [ "${app_confirmed[$i]}" = yes ]; then
+        offered="$offered${app_token[$i]} "
+        case ${app_group[$i]} in
+          silent|assisted)
+            if [ "${app_managed[$i]}" = yes ]; then
+              report_success "${app_name[$i]} already managed"
+            elif blocker=$(link_in_the_way "${app_links[$i]}"); then
+              report_skipped "${app_name[$i]} not adopted: ${blocker#[?+]} is in the way of a link Homebrew makes for it, or cannot be placed; see the warning above"
+            elif [ "${app_adoptable[$i]}" != yes ]; then
+              report_skipped "${app_name[$i]} not adopted: its cask has steps Homebrew could roll back (${app_extra[$i]})"
+            elif [ "${app_writable[$i]}" != yes ]; then
+              report_skipped "${app_name[$i]} not adopted: this account cannot write its bundle"
+            elif [ "${app_in_apps[$i]}" != yes ]; then
+              report_skipped "${app_name[$i]} not adopted: it is not directly inside $APPLICATIONS_DIR"
+            elif prompt_consent "Adopt ${app_name[$i]} ${app_version[$i]} into Homebrew?" no; then
+              if adopt_cask "$i"; then adopted=$((adopted + 1)); fi
+            else
+              report_skipped "${app_name[$i]} left unmanaged"
+            fi
+            ;;
+        esac
+      fi
+      i=$((i + 1))
+    done
+  fi
+  term_phase_heading "5/5" "macOS automatic updates"
+  report_detail "AutomaticDownload = $(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload 2>/dev/null || printf 'not set')"
+  report_detail "AutomaticallyInstallMacOSUpdates = $(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null || printf 'not visible here')"
+  report_detail "In the pane, turn on: Download new updates when available; Install macOS updates; Install Security Responses and system files."
+  if prompt_consent "Open the Software Update settings pane now?" no; then
+    open "$SOFTWARE_UPDATE_PANE" >>"$RUN_SINK" 2>&1 || report_warning "The settings pane could not be opened"
+  fi
+  report_detail "Confirmed $confirmed app(s), adopted $adopted"
+  pass_outcome
+  report_verdict "$PASS_OUTCOME" "$PASS_STATUS" "confirmed=$confirmed adopted=$adopted failures=$(printf '%s' "${REPORT_FAILURE_TAGS:--}" | tr ' ' ',')"
+}
+
+agent_state_lines() {
+  local label plist rendered
+  label=$(agent_label)
+  plist=$LAUNCH_AGENTS/$label.plist
+  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    report_success "The schedule is loaded ($label)"
+  else
+    report_warning "The schedule is not loaded ($label). Run install.sh from the folder you downloaded to load it"
+  fi
+  if [ ! -f "$plist" ]; then
+    report_detail "No LaunchAgent file at $plist"
+    return 0
+  fi
+  if ! rendered=$(render_plist); then
+    report_warning "The LaunchAgent could not be rendered for comparison"
+    return 0
+  fi
+  if [ "$(cat "$plist")" = "$rendered" ]; then
+    report_success "The LaunchAgent on disk matches this config"
+  else
+    report_warning "The LaunchAgent on disk differs from what this config renders; run install.sh again from the folder you downloaded to apply the config"
+  fi
+}
+
+mode_check() {
+  local missing outdated
+  DRY_RUN=1
+  banner
+  report_detail "Config: $CONFIG_STATE ($CONFIG_FILE)"
+  missing=$(missing_tools jq plutil brew)
+  if [ -n "$missing" ]; then
+    report_failure "Missing tools: $missing. The passes stop at their preflight until they are installed, and the Homebrew answers below cannot be read" "tools"
+  fi
+  heartbeat_check
+  term_phase_heading "1/3" "Dock apps"
+  index_age_line
+  load_dock_inventory
+  print_inventory
+  report_mapping
+  if query_outdated; then
+    outdated=$(outdated_indices)
+    report_stale_records "$outdated"
+    [ -z "$outdated" ] || report_detail "Homebrew lists a newer version of: $(joined_indices "$outdated")"
+  fi
+  term_phase_heading "2/3" "macOS"
+  phase_macos dry
+  term_phase_heading "3/3" "Schedule"
+  report_detail "Next unattended pass: $(next_fire_time)"
+  agent_state_lines
+  if [ "$REPORT_FAILURE_COUNT" -gt 0 ]; then
+    printf '\n  Check finished with issues: %s\n\n' "$REPORT_FAILURE_TAGS"
+    exit 1
+  fi
+  printf '\n  Check finished; nothing was changed and nothing was written.\n\n'
+  exit 0
+}
+
+mode_status() {
+  local pending
+  DRY_RUN=1
+  banner
+  report_detail "Config: $CONFIG_STATE ($CONFIG_FILE)"
+  term_phase_heading "1/3" "History"
+  if [ -f "$HISTORY_FILE" ]; then
+    tail -n 10 "$HISTORY_FILE" | tr '\t' ' ' | sed 's/^/    /'
+  else
+    report_detail "No history yet"
+  fi
+  heartbeat_check
+  pending=$(LC_ALL=C awk -F'\t' '$3 == "restart-requested"' "$HISTORY_FILE" 2>/dev/null | tail -n 3)
+  if [ -n "$pending" ]; then
+    report_detail "Restart requests on record:"
+    printf '%s\n' "$pending" | tr '\t' ' ' | sed 's/^/      /'
+    report_detail "softwareupdate history, last 5, to confirm they completed:"
+    softwareupdate --history 2>/dev/null | tail -n 5 | sed 's/^/      /'
+  fi
+  term_phase_heading "2/3" "Schedule"
+  report_detail "Slots: weekday $WEEKDAY, $FIRST_HOUR:$(printf '%02d' "$MINUTE") to $LAST_HOUR:$(printf '%02d' "$MINUTE"), hourly"
+  report_detail "Next unattended pass: $(next_fire_time)"
+  agent_state_lines
+  term_phase_heading "3/3" "Sizes"
+  if [ -d "$LOG_DIR" ]; then
+    report_detail "Log folder: $(du -sh "$LOG_DIR" 2>/dev/null | cut -f 1) at $LOG_DIR"
+  else
+    report_detail "Log folder: none yet ($LOG_DIR is created by the first pass)"
+  fi
+  report_detail "Homebrew download cache: $(du -sh "$(brew --cache 2>/dev/null)" 2>/dev/null | cut -f 1). Nothing here removes it; cleaning it is up to you"
+  printf '\n'
+  exit 0
+}
+
+parse_arguments "$@"
+case $MODE in
+  version)
+    printf 'weekly-update %s\n' "$WU_VERSION"
+    exit 0
+    ;;
+  help)
+    if [ -n "$HELP_TOPIC" ]; then
+      print_mode_help "$HELP_TOPIC"
+      exit $?
+    fi
+    print_help
+    exit 0
+    ;;
+esac
+# Under sudo, HOME stays the person's, so the log folder, its history and the
+# run lock would become root's and every later slot would stop. This runs
+# before the config is read, because an invalid config also writes a record.
+case $MODE in
+  run|auto|scheduled|setup)
+    if [ "$DRY_RUN" != 1 ] && [ "$(id -u)" = 0 ]; then
+      printf 'weekly-update %s must run as the person who uses this Mac, not as root: files it made would belong to root and stop every later run. Run it again without sudo.\n' "$MODE" >&2
+      exit 2
+    fi
+    ;;
+esac
+load_config || config_invalid_exit
+REPORT_MODE=$MODE
+case $MODE in
+  plist)
+    render_plist
+    exit $?
+    ;;
+  verify)
+    exec "$VERIFY"
+    ;;
+  check) mode_check ;;
+  status) mode_status ;;
+esac
+if [ "$DRY_RUN" != 1 ]; then
+  case $MODE in
+    run|scheduled|setup)
+      if ! prompt_is_interactive; then
+        printf 'weekly-update %s needs a Terminal window. Open Terminal and run it there.\n' "$MODE" >&2
+        exit 4
+      fi
+      ;;
+  esac
+  if mkdir -p "$LOG_DIR" 2>/dev/null && [ -w "$LOG_DIR" ]; then
+    LEDGERS_WRITABLE=1
+  fi
+  REPORT_HISTORY_FILE=$HISTORY_FILE
+  lifecycle_install_traps
+fi
+case $MODE in
+  run) mode_run ;;
+  auto) mode_auto ;;
+  scheduled) mode_scheduled ;;
+  setup) mode_setup ;;
+esac
+exit 1

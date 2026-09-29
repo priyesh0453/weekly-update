@@ -1,0 +1,28 @@
+#!/bin/bash
+# osascript: a test double. A display notification goes to notifications.log;
+# a quit clears the app's running marker, unless the scenario marks the app
+# stuck, so an app that never answers its quit can be tested.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+printf 'osascript %s\n' "$*" >> "$state/calls.log"
+[ "${1:-}" = -e ] || { printf 'UNEXPECTED osascript %s\n' "$*" >> "$state/calls.log"; exit 97; }
+script=${2:-}
+case $script in
+  'display notification "'*)
+    message=${script#display notification \"}
+    message=${message%%\" with title*}
+    printf '%s\n' "$message" >> "$state/notifications.log"
+    ;;
+  'tell application id "'*'" to quit')
+    bundle=${script#tell application id \"}
+    bundle=${bundle%%\"*}
+    if [ ! -f "$state/scenario/osascript/stuck-$bundle" ] && [ -f "$state/running/$bundle" ]; then
+      mv "$state/running/$bundle" "$state/running/.quit-$bundle"
+    fi
+    ;;
+  *)
+    printf 'UNEXPECTED osascript %s\n' "$*" >> "$state/calls.log"
+    exit 97
+    ;;
+esac
+exit 0

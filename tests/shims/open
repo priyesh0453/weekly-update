@@ -1,0 +1,23 @@
+#!/bin/bash
+# open: a test double. -a Terminal records a window instead of opening one;
+# -b marks the app running, or fails or starts nothing when the scenario says
+# so; the settings-pane URL is accepted and does nothing.
+[ "${WU_TEST:-}" = 1 ] && [ -n "${WU_TEST_STATE:-}" ] || { printf 'shim: refusing to run outside the test harness\n' >&2; exit 97; }
+state=$WU_TEST_STATE
+printf 'open %s\n' "$*" >> "$state/calls.log"
+case ${1:-} in
+  -a)
+    [ "${2:-}" = Terminal ] || { printf 'UNEXPECTED open %s\n' "$*" >> "$state/calls.log"; exit 97; }
+    printf 'window %s\n' "${3:-}" >> "$state/calls.log"
+    ;;
+  -b)
+    [ -f "$state/scenario/open/fail-${2:-}" ] && exit 1
+    [ -f "$state/scenario/open/no-start-${2:-}" ] || : > "$state/running/${2:-}"
+    ;;
+  x-apple.systempreferences:*) ;;
+  *)
+    printf 'UNEXPECTED open %s\n' "$*" >> "$state/calls.log"
+    exit 97
+    ;;
+esac
+exit 0
